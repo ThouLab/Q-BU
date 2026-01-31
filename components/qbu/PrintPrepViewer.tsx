@@ -1,7 +1,23 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import * as THREE from "three";
+import {
+  WebGLRenderer,
+  Scene,
+  PerspectiveCamera,
+  Raycaster,
+  Vector2,
+  Group,
+  Color,
+  AmbientLight,
+  DirectionalLight,
+  BoxGeometry,
+  MeshStandardMaterial,
+  InstancedMesh,
+  Matrix4,
+  GridHelper,
+  Object3D,
+} from "three";
 
 import { add, computeBBox, keyOf, parseKey, type Coord } from "./voxelUtils";
 
@@ -23,22 +39,22 @@ function snapAxisNormal(n: any): Coord {
 }
 
 type ThreeState = {
-  renderer: THREE.WebGLRenderer;
-  scene: THREE.Scene;
-  camera: THREE.PerspectiveCamera;
-  raycaster: THREE.Raycaster;
-  mouse: THREE.Vector2;
-  root: THREE.Group;
+  renderer: InstanceType<typeof WebGLRenderer>;
+  scene: InstanceType<typeof Scene>;
+  camera: InstanceType<typeof PerspectiveCamera>;
+  raycaster: InstanceType<typeof Raycaster>;
+  mouse: InstanceType<typeof Vector2>;
+  root: InstanceType<typeof Group>;
 
-  cubeGeo: THREE.BoxGeometry;
-  matMain: THREE.MeshStandardMaterial;
-  matFloat: THREE.MeshStandardMaterial;
-  matExtra: THREE.MeshStandardMaterial;
+  cubeGeo: InstanceType<typeof BoxGeometry>;
+  matMain: InstanceType<typeof MeshStandardMaterial>;
+  matFloat: InstanceType<typeof MeshStandardMaterial>;
+  matExtra: InstanceType<typeof MeshStandardMaterial>;
 
-  meshMain?: THREE.InstancedMesh;
-  meshFloat?: THREE.InstancedMesh;
-  meshExtra?: THREE.InstancedMesh;
-  grid?: THREE.GridHelper;
+  meshMain?: InstanceType<typeof InstancedMesh>;
+  meshFloat?: InstanceType<typeof InstancedMesh>;
+  meshExtra?: InstanceType<typeof InstancedMesh>;
+  grid?: InstanceType<typeof GridHelper>;
 
   keysMain: string[];
   keysFloat: string[];
@@ -52,8 +68,7 @@ type ThreeState = {
     center: Coord;
   };
 };
-
-function disposeMesh(m?: THREE.InstancedMesh) {
+function disposeMesh(m?: InstanceType<typeof InstancedMesh>) {
   if (!m) return;
   m.geometry.dispose();
   // materials are shared; do not dispose here
@@ -94,38 +109,38 @@ export default function PrintPrepViewer(props: {
     return s;
   }, [baseBlocks, extraBlocks]);
 
-  const bbox = useMemo(() => computeBBox(combined), [combined]);
+  // bbox は将来の調整用に残す（現状は computeBBox だけでOK）
+  useMemo(() => computeBBox(combined), [combined]);
 
   // 初期化
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    const renderer = new WebGLRenderer({ antialias: true, alpha: false });
     renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
-    renderer.setClearColor(new THREE.Color("#f7f7fb"), 1);
+    renderer.setClearColor(new Color("#f7f7fb"), 1);
 
-    const scene = new THREE.Scene();
+    const scene = new Scene();
+    const camera = new PerspectiveCamera(45, 1, 0.1, 2000);
 
-    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 2000);
+    const raycaster = new Raycaster();
+    const mouse = new Vector2();
 
-    const raycaster = new THREE.Raycaster();
-    const mouse = new THREE.Vector2();
-
-    const root = new THREE.Group();
+    const root = new Group();
     scene.add(root);
 
     // lights
-    const ambient = new THREE.AmbientLight(0xffffff, 0.75);
+    const ambient = new AmbientLight(0xffffff, 0.75);
     scene.add(ambient);
-    const dir = new THREE.DirectionalLight(0xffffff, 0.65);
+    const dir = new DirectionalLight(0xffffff, 0.65);
     dir.position.set(10, 18, 12);
     scene.add(dir);
 
-    const cubeGeo = new THREE.BoxGeometry(1, 1, 1);
-    const matMain = new THREE.MeshStandardMaterial({ color: new THREE.Color("#d1d5db"), roughness: 1, metalness: 0 });
-    const matFloat = new THREE.MeshStandardMaterial({ color: new THREE.Color("#ef4444"), roughness: 1, metalness: 0 });
-    const matExtra = new THREE.MeshStandardMaterial({ color: new THREE.Color("#3b82f6"), roughness: 1, metalness: 0 });
+    const cubeGeo = new BoxGeometry(1, 1, 1);
+    const matMain = new MeshStandardMaterial({ color: new Color("#d1d5db"), roughness: 1, metalness: 0 });
+    const matFloat = new MeshStandardMaterial({ color: new Color("#ef4444"), roughness: 1, metalness: 0 });
+    const matExtra = new MeshStandardMaterial({ color: new Color("#3b82f6"), roughness: 1, metalness: 0 });
 
     const st: ThreeState = {
       renderer,
@@ -169,7 +184,6 @@ export default function PrintPrepViewer(props: {
     let raf = 0;
     const loop = () => {
       raf = requestAnimationFrame(loop);
-      // camera update each frame
       const t = threeRef.current;
       if (!t) return;
 
@@ -270,7 +284,7 @@ export default function PrintPrepViewer(props: {
 
     // grid helper
     const gridSize = Math.max(12, bb.maxDim + 16);
-    const grid = new THREE.GridHelper(gridSize, gridSize);
+    const grid = new GridHelper(gridSize, gridSize);
     (grid.material as any).opacity = 0.22;
     (grid.material as any).transparent = true;
     t.grid = grid;
@@ -282,8 +296,8 @@ export default function PrintPrepViewer(props: {
     const ek = extraKeys;
 
     if (mk.length > 0) {
-      const m = new THREE.InstancedMesh(t.cubeGeo.clone(), t.matMain, mk.length);
-      const mat = new THREE.Matrix4();
+      const m = new InstancedMesh(t.cubeGeo.clone(), t.matMain, mk.length);
+      const mat = new Matrix4();
       for (let i = 0; i < mk.length; i++) {
         const c = parseKey(mk[i]!);
         mat.makeTranslation(c.x, c.y, c.z);
@@ -295,8 +309,8 @@ export default function PrintPrepViewer(props: {
     }
 
     if (fk.length > 0) {
-      const m = new THREE.InstancedMesh(t.cubeGeo.clone(), t.matFloat, fk.length);
-      const mat = new THREE.Matrix4();
+      const m = new InstancedMesh(t.cubeGeo.clone(), t.matFloat, fk.length);
+      const mat = new Matrix4();
       for (let i = 0; i < fk.length; i++) {
         const c = parseKey(fk[i]!);
         mat.makeTranslation(c.x, c.y, c.z);
@@ -308,8 +322,8 @@ export default function PrintPrepViewer(props: {
     }
 
     if (ek.length > 0) {
-      const m = new THREE.InstancedMesh(t.cubeGeo.clone(), t.matExtra, ek.length);
-      const mat = new THREE.Matrix4();
+      const m = new InstancedMesh(t.cubeGeo.clone(), t.matExtra, ek.length);
+      const mat = new Matrix4();
       for (let i = 0; i < ek.length; i++) {
         const c = parseKey(ek[i]!);
         mat.makeTranslation(c.x, c.y, c.z);
@@ -336,7 +350,7 @@ export default function PrintPrepViewer(props: {
     t.mouse.set(x, y);
     t.raycaster.setFromCamera(t.mouse, t.camera);
 
-    const objs: THREE.Object3D[] = [];
+    const objs: InstanceType<typeof Object3D>[] = [];
     if (t.meshExtra) objs.push(t.meshExtra);
     if (t.meshFloat) objs.push(t.meshFloat);
     if (t.meshMain) objs.push(t.meshMain);
@@ -361,8 +375,15 @@ export default function PrintPrepViewer(props: {
     }
 
     // 左クリック: 面方向に 1 ブロック追加（extraとして）
-    const baseKey = isExtra ? t.keysExtra[instanceId] : obj === t.meshFloat ? t.keysFloat[instanceId] : t.keysMain[instanceId];
+    const baseKey =
+      isExtra
+        ? t.keysExtra[instanceId]
+        : obj === t.meshFloat
+          ? t.keysFloat[instanceId]
+          : t.keysMain[instanceId];
+
     if (!baseKey) return;
+
     const baseCoord = parseKey(baseKey);
     const n = snapAxisNormal(hit.face?.normal ?? { x: 0, y: 1, z: 0 });
     const next = add(baseCoord, n);
@@ -401,7 +422,7 @@ export default function PrintPrepViewer(props: {
           e.preventDefault();
         }}
         onMouseDown={(e) => {
-          if (e.button === 2) return; // handled by onMouseUp/context
+          if (e.button === 2) return;
           handlePointer(e, false);
         }}
         onMouseUp={(e) => {
