@@ -17,9 +17,19 @@ import {
   Matrix4,
   GridHelper,
   Object3D,
+  Vector3,
 } from "three";
 
-import { add, computeBBox, keyOf, parseKey, type Coord } from "./voxelUtils";
+import { parseKey, type Coord } from "./voxelUtils";
+import {
+  computeMixedBBox,
+  expandBaseBlocksToSubCells,
+  parseSubKey,
+  subKeyOf,
+  subMinToWorldCenter,
+  worldMinToSubMin,
+  type SubKey,
+} from "./subBlocks";
 
 const STEP_DEG = 45;
 const STEP = (Math.PI / 180) * STEP_DEG;
@@ -38,6 +48,11 @@ function snapAxisNormal(n: any): Coord {
   return { x: 0, y: 0, z: n.z >= 0 ? 1 : -1 };
 }
 
+// Support cubes are 0.5 edge -> center is always (k*0.5 + 0.25)
+function quantizeSupportCenter(v: number): number {
+  return Math.round((v - 0.25) / 0.5) * 0.5 + 0.25;
+}
+
 type ThreeState = {
   renderer: InstanceType<typeof WebGLRenderer>;
   scene: InstanceType<typeof Scene>;
@@ -47,18 +62,21 @@ type ThreeState = {
   root: InstanceType<typeof Group>;
 
   cubeGeo: InstanceType<typeof BoxGeometry>;
+  supportGeo: InstanceType<typeof BoxGeometry>;
   matMain: InstanceType<typeof MeshStandardMaterial>;
   matFloat: InstanceType<typeof MeshStandardMaterial>;
-  matExtra: InstanceType<typeof MeshStandardMaterial>;
+  matSupport: InstanceType<typeof MeshStandardMaterial>;
 
   meshMain?: InstanceType<typeof InstancedMesh>;
   meshFloat?: InstanceType<typeof InstancedMesh>;
-  meshExtra?: InstanceType<typeof InstancedMesh>;
+  meshSupport?: InstanceType<typeof InstancedMesh>;
+  meshSupportFloat?: InstanceType<typeof InstancedMesh>;
   grid?: InstanceType<typeof GridHelper>;
 
   keysMain: string[];
   keysFloat: string[];
-  keysExtra: string[];
+  keysSupport: SubKey[];
+  keysSupportFloat: SubKey[];
 
   anim: {
     yaw: number;
@@ -68,6 +86,7 @@ type ThreeState = {
     center: Coord;
   };
 };
+
 function disposeMesh(m?: InstanceType<typeof InstancedMesh>) {
   if (!m) return;
   m.geometry.dispose();
@@ -76,12 +95,30 @@ function disposeMesh(m?: InstanceType<typeof InstancedMesh>) {
 
 export default function PrintPrepViewer(props: {
   baseBlocks: Set<string>;
-  extraBlocks: Set<string>;
-  floating: Set<string>;
-  onAddExtra: (c: Coord) => void;
-  onRemoveExtra: (c: Coord) => void;
+  supportBlocks: Set<SubKey>;
+  floatingBase: Set<string>;
+  floatingSupport: Set<SubKey>;
+  onAddSupport: (k: SubKey) => void;
+  onRemoveSupport: (k: SubKey) => void;
 }) {
-  const { baseBlocks, extraBlocks, floating, onAddExtra, onRemoveExtra } = props;
+  const { baseBlocks, supportBlocks, floatingBase, floatingSupport, onAddSupport, onRemoveSupport } = props;
+
+  // HUD: スマホは情報量を抑える
+  const [isCompactHud, setIsCompactHud] = useState(false);
+  const [showHelp, setShowHelp] = useState(true);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 600px)");
+    const apply = () => setIsCompactHud(mq.matches);
+    apply();
+    mq.addEventListener?.("change", apply);
+    return () => mq.removeEventListener?.("change", apply);
+  }, []);
+
+  useEffect(() => {
+    if (isCompactHud) setShowHelp(false);
+    else setShowHelp(true);
+  }, [isCompactHud]);
 
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const threeRef = useRef<ThreeState | null>(null);
@@ -91,26 +128,28 @@ export default function PrintPrepViewer(props: {
 
   // 状態参照（stale回避）
   const baseRef = useRef(baseBlocks);
-  const extraRef = useRef(extraBlocks);
-  const floatingRef = useRef(floating);
+  const supportRef = useRef(supportBlocks);
+  const floatingBaseRef = useRef(floatingBase);
+  const floatingSupportRef = useRef(floatingSupport);
+
+  const baseSubCells = useMemo(() => expandBaseBlocksToSubCells(baseBlocks), [baseBlocks]);
+  const baseSubCellsRef = useRef(baseSubCells);
+
   useEffect(() => {
     baseRef.current = baseBlocks;
   }, [baseBlocks]);
   useEffect(() => {
-    extraRef.current = extraBlocks;
-  }, [extraBlocks]);
+    supportRef.current = supportBlocks;
+  }, [supportBlocks]);
   useEffect(() => {
-    floatingRef.current = floating;
-  }, [floating]);
-
-  const combined = useMemo(() => {
-    const s = new Set<string>(baseBlocks);
-    for (const k of extraBlocks) s.add(k);
-    return s;
-  }, [baseBlocks, extraBlocks]);
-
-  // bbox は将来の調整用に残す（現状は computeBBox だけでOK）
-  useMemo(() => computeBBox(combined), [combined]);
+    floatingBaseRef.current = floatingBase;
+  }, [floatingBase]);
+  useEffect(() => {
+    floatingSupportRef.current = floatingSupport;
+  }, [floatingSupport]);
+  useEffect(() => {
+    baseSubCellsRef.current = baseSubCells;
+  }, [baseSubCells]);
 
   // 初期化
   useEffect(() => {
@@ -138,9 +177,11 @@ export default function PrintPrepViewer(props: {
     scene.add(dir);
 
     const cubeGeo = new BoxGeometry(1, 1, 1);
+    const supportGeo = new BoxGeometry(0.5, 0.5, 0.5);
+
     const matMain = new MeshStandardMaterial({ color: new Color("#d1d5db"), roughness: 1, metalness: 0 });
     const matFloat = new MeshStandardMaterial({ color: new Color("#ef4444"), roughness: 1, metalness: 0 });
-    const matExtra = new MeshStandardMaterial({ color: new Color("#3b82f6"), roughness: 1, metalness: 0 });
+    const matSupport = new MeshStandardMaterial({ color: new Color("#3b82f6"), roughness: 1, metalness: 0 });
 
     const st: ThreeState = {
       renderer,
@@ -150,12 +191,14 @@ export default function PrintPrepViewer(props: {
       mouse,
       root,
       cubeGeo,
+      supportGeo,
       matMain,
       matFloat,
-      matExtra,
+      matSupport,
       keysMain: [],
       keysFloat: [],
-      keysExtra: [],
+      keysSupport: [],
+      keysSupportFloat: [],
       anim: {
         yaw: yawIndex * STEP,
         pitch: pitchIndex * STEP,
@@ -166,6 +209,7 @@ export default function PrintPrepViewer(props: {
     };
 
     threeRef.current = st;
+    renderer.domElement.style.touchAction = "none";
     el.appendChild(renderer.domElement);
 
     const resize = () => {
@@ -217,18 +261,33 @@ export default function PrintPrepViewer(props: {
       }
       disposeMesh(st.meshMain);
       disposeMesh(st.meshFloat);
-      disposeMesh(st.meshExtra);
+      disposeMesh(st.meshSupport);
+      disposeMesh(st.meshSupportFloat);
       cubeGeo.dispose();
+      supportGeo.dispose();
       matMain.dispose();
       matFloat.dispose();
-      matExtra.dispose();
+      matSupport.dispose();
       renderer.dispose();
       threeRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // カメラターゲット（状態）
+  // Space: reset pan center
+  useEffect(() => {
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.code !== "Space" && ev.key !== " ") return;
+      ev.preventDefault();
+      const t = threeRef.current;
+      if (!t) return;
+      t.anim.center = { x: 0, y: 0, z: 0 };
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+// カメラターゲット（状態）
   useEffect(() => {
     const t = threeRef.current;
     if (!t) return;
@@ -252,10 +311,15 @@ export default function PrintPrepViewer(props: {
       disposeMesh(t.meshFloat);
       t.meshFloat = undefined;
     }
-    if (t.meshExtra) {
-      t.root.remove(t.meshExtra);
-      disposeMesh(t.meshExtra);
-      t.meshExtra = undefined;
+    if (t.meshSupport) {
+      t.root.remove(t.meshSupport);
+      disposeMesh(t.meshSupport);
+      t.meshSupport = undefined;
+    }
+    if (t.meshSupportFloat) {
+      t.root.remove(t.meshSupportFloat);
+      disposeMesh(t.meshSupportFloat);
+      t.meshSupportFloat = undefined;
     }
     if (t.grid) {
       t.scene.remove(t.grid);
@@ -267,14 +331,18 @@ export default function PrintPrepViewer(props: {
     const mainKeys: string[] = [];
     const floatKeys: string[] = [];
     for (const k of baseBlocks) {
-      if (floating.has(k)) floatKeys.push(k);
+      if (floatingBase.has(k)) floatKeys.push(k);
       else mainKeys.push(k);
     }
-    const extraKeys = Array.from(extraBlocks);
 
-    // bbox and centering
-    const bb = computeBBox(new Set<string>([...baseBlocks, ...extraBlocks]));
-    t.anim.center = { x: 0, y: 0, z: 0 };
+    const supportKeys: SubKey[] = [];
+    const supportFloatKeys: SubKey[] = [];
+    for (const sk of supportBlocks) {
+      if (floatingSupport.has(sk)) supportFloatKeys.push(sk);
+      else supportKeys.push(sk);
+    }
+
+    const bb = computeMixedBBox(baseBlocks, supportBlocks);
 
     // root moves model so bbox.center becomes origin
     t.root.position.set(-bb.center.x, -bb.center.y, -bb.center.z);
@@ -283,17 +351,20 @@ export default function PrintPrepViewer(props: {
     t.anim.baseRadius = Math.max(12, bb.maxDim * 2.8 + 8);
 
     // grid helper
-    const gridSize = Math.max(12, bb.maxDim + 16);
+    const gridSize = Math.max(12, Math.ceil(bb.maxDim + 16));
     const grid = new GridHelper(gridSize, gridSize);
     (grid.material as any).opacity = 0.22;
     (grid.material as any).transparent = true;
+    // Keep the grid on the model's bottom face.
+    grid.position.y = -bb.size.y / 2 - 0.001;
     t.grid = grid;
     t.scene.add(grid);
 
     // instanced meshes
     const mk = mainKeys;
     const fk = floatKeys;
-    const ek = extraKeys;
+    const sk = supportKeys;
+    const sfk = supportFloatKeys;
 
     if (mk.length > 0) {
       const m = new InstancedMesh(t.cubeGeo.clone(), t.matMain, mk.length);
@@ -321,37 +392,113 @@ export default function PrintPrepViewer(props: {
       t.root.add(m);
     }
 
-    if (ek.length > 0) {
-      const m = new InstancedMesh(t.cubeGeo.clone(), t.matExtra, ek.length);
+    if (sk.length > 0) {
+      const m = new InstancedMesh(t.supportGeo.clone(), t.matSupport, sk.length);
       const mat = new Matrix4();
-      for (let i = 0; i < ek.length; i++) {
-        const c = parseKey(ek[i]!);
+      for (let i = 0; i < sk.length; i++) {
+        const c = subMinToWorldCenter(parseSubKey(sk[i]!));
         mat.makeTranslation(c.x, c.y, c.z);
         m.setMatrixAt(i, mat);
       }
       m.instanceMatrix.needsUpdate = true;
-      t.meshExtra = m;
+      t.meshSupport = m;
+      t.root.add(m);
+    }
+
+    if (sfk.length > 0) {
+      const m = new InstancedMesh(t.supportGeo.clone(), t.matFloat, sfk.length);
+      const mat = new Matrix4();
+      for (let i = 0; i < sfk.length; i++) {
+        const c = subMinToWorldCenter(parseSubKey(sfk[i]!));
+        mat.makeTranslation(c.x, c.y, c.z);
+        m.setMatrixAt(i, mat);
+      }
+      m.instanceMatrix.needsUpdate = true;
+      t.meshSupportFloat = m;
       t.root.add(m);
     }
 
     t.keysMain = mk;
     t.keysFloat = fk;
-    t.keysExtra = ek;
-  }, [baseBlocks, extraBlocks, floating]);
+    t.keysSupport = sk;
+    t.keysSupportFloat = sfk;
+  }, [baseBlocks, supportBlocks, floatingBase, floatingSupport]);
+  const PAN_BUTTONS = 4; // mouse middle button
+  const TAP_MOVE_PX = 8;
+  const LONG_PRESS_MS = 480;
 
-  const handlePointer = (ev: React.MouseEvent, isRightClick: boolean) => {
+  const gestureRef = useRef({
+    mousePanning: false,
+    lastMouseX: 0,
+    lastMouseY: 0,
+
+    touches: new Map<number, { x: number; y: number }>(),
+    mode: "none" as "none" | "one" | "two",
+    startX: 0,
+    startY: 0,
+    moved: false,
+    longPressTimer: 0 as any,
+    longPressFired: false,
+    pinchStartDist: 0,
+    pinchStartZoom: 1,
+    lastMidX: 0,
+    lastMidY: 0,
+  });
+
+  const clearLongPress = () => {
+    const g = gestureRef.current;
+    if (g.longPressTimer) {
+      window.clearTimeout(g.longPressTimer);
+      g.longPressTimer = 0;
+    }
+  };
+
+  const panByPixels = (dx: number, dy: number) => {
     const t = threeRef.current;
     const el = wrapRef.current;
     if (!t || !el) return;
 
     const rect = el.getBoundingClientRect();
-    const x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-    const y = -(((ev.clientY - rect.top) / rect.height) * 2 - 1);
+    const w = Math.max(1, rect.width);
+    const h = Math.max(1, rect.height);
+
+    const center = new Vector3(t.anim.center.x, t.anim.center.y, t.anim.center.z);
+    const dist = t.camera.position.distanceTo(center);
+    const fov = (t.camera.fov * Math.PI) / 180;
+    const worldPerPixelY = (2 * dist * Math.tan(fov / 2)) / h;
+    const worldPerPixelX = worldPerPixelY * (w / h);
+
+    const forward = new Vector3();
+    t.camera.getWorldDirection(forward);
+    const upWorld = new Vector3(0, 1, 0).applyQuaternion(t.camera.quaternion).normalize();
+    const rightWorld = new Vector3().crossVectors(forward, upWorld).normalize();
+
+    const delta = new Vector3()
+      .addScaledVector(rightWorld, -dx * worldPerPixelX)
+      .addScaledVector(upWorld, dy * worldPerPixelY);
+
+    t.anim.center = {
+      x: t.anim.center.x + delta.x,
+      y: t.anim.center.y + delta.y,
+      z: t.anim.center.z + delta.z,
+    };
+  };
+
+  const handlePointerAt = (clientX: number, clientY: number, action: "add" | "remove") => {
+    const t = threeRef.current;
+    const el = wrapRef.current;
+    if (!t || !el) return;
+
+    const rect = el.getBoundingClientRect();
+    const x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const y = -(((clientY - rect.top) / rect.height) * 2 - 1);
     t.mouse.set(x, y);
     t.raycaster.setFromCamera(t.mouse, t.camera);
 
     const objs: InstanceType<typeof Object3D>[] = [];
-    if (t.meshExtra) objs.push(t.meshExtra);
+    // prioritize supports (smaller)
+    if (t.meshSupport) objs.push(t.meshSupport);
+    if (t.meshSupportFloat) objs.push(t.meshSupportFloat);
     if (t.meshFloat) objs.push(t.meshFloat);
     if (t.meshMain) objs.push(t.meshMain);
 
@@ -363,36 +510,255 @@ export default function PrintPrepViewer(props: {
     const instanceId = (hit as any).instanceId as number | undefined;
     if (instanceId === undefined || instanceId === null) return;
 
-    const isExtra = obj === t.meshExtra;
+    const isSupport = obj === t.meshSupport || obj === t.meshSupportFloat;
 
-    // 右クリック: extraのみ削除
-    if (isRightClick) {
-      if (!isExtra) return;
-      const k = t.keysExtra[instanceId];
+    // remove: supports only
+    if (action === "remove") {
+      if (!isSupport) return;
+      const k = obj === t.meshSupport ? t.keysSupport[instanceId] : t.keysSupportFloat[instanceId];
       if (!k) return;
-      onRemoveExtra(parseKey(k));
+      onRemoveSupport(k);
       return;
     }
 
-    // 左クリック: 面方向に 1 ブロック追加（extraとして）
-    const baseKey =
-      isExtra
-        ? t.keysExtra[instanceId]
-        : obj === t.meshFloat
-          ? t.keysFloat[instanceId]
-          : t.keysMain[instanceId];
+    // add: place a 0.5 support cube adjacent to the clicked face
+    const faceN = snapAxisNormal(hit.face?.normal ?? { x: 0, y: 1, z: 0 });
 
-    if (!baseKey) return;
+    let clickedCenter: Coord = { x: 0, y: 0, z: 0 };
+    let clickedHalf = 0.5;
 
-    const baseCoord = parseKey(baseKey);
-    const n = snapAxisNormal(hit.face?.normal ?? { x: 0, y: 1, z: 0 });
-    const next = add(baseCoord, n);
-    const nk = keyOf(next);
+    if (isSupport) {
+      const k = obj === t.meshSupport ? t.keysSupport[instanceId] : t.keysSupportFloat[instanceId];
+      if (!k) return;
+      clickedCenter = subMinToWorldCenter(parseSubKey(k));
+      clickedHalf = 0.25;
+    } else {
+      const k = obj === t.meshFloat ? t.keysFloat[instanceId] : t.keysMain[instanceId];
+      if (!k) return;
+      clickedCenter = parseKey(k);
+      clickedHalf = 0.5;
+    }
 
-    if (baseRef.current.has(nk)) return;
-    if (extraRef.current.has(nk)) return;
-    onAddExtra(next);
+    // hit point in model space (root local)
+    const p = new Vector3(hit.point.x, hit.point.y, hit.point.z);
+    p.sub(t.root.position);
+
+    const newCenter: Coord = { x: 0, y: 0, z: 0 };
+
+    for (const axis of ["x", "y", "z"] as const) {
+      const n = (faceN as any)[axis] as number;
+      if (n !== 0) {
+        // along normal axis, move outside by (clickedHalf + supportHalf)
+        const v = (clickedCenter as any)[axis] + n * (clickedHalf + 0.25);
+        (newCenter as any)[axis] = quantizeSupportCenter(v);
+      } else {
+        // within face plane, snap based on click location
+        const v = (p as any)[axis] as number;
+        (newCenter as any)[axis] = quantizeSupportCenter(v);
+      }
+    }
+
+    const minWorld: Coord = { x: newCenter.x - 0.25, y: newCenter.y - 0.25, z: newCenter.z - 0.25 };
+    const subMin = worldMinToSubMin(minWorld);
+    const newKey = subKeyOf(subMin);
+
+    // collision checks (do not place inside base blocks or on existing supports)
+    if (baseSubCellsRef.current.has(newKey)) return;
+    if (supportRef.current.has(newKey)) return;
+
+    onAddSupport(newKey);
   };
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    const g = gestureRef.current;
+
+    if (e.pointerType === "mouse") {
+      // middle button drag => pan
+      if (e.button === 1) {
+        e.preventDefault();
+        g.mousePanning = true;
+        g.lastMouseX = e.clientX;
+        g.lastMouseY = e.clientY;
+        return;
+      }
+
+      // right click remove (only when right button alone)
+      if (e.button === 2) {
+        if (e.buttons === 2) {
+          e.preventDefault();
+          handlePointerAt(e.clientX, e.clientY, "remove");
+        }
+        return;
+      }
+
+      // left click add (only when left button alone)
+      if (e.button === 0 && e.buttons === 1) {
+        handlePointerAt(e.clientX, e.clientY, "add");
+      }
+      return;
+    }
+
+    if (e.pointerType === "touch") {
+      e.preventDefault();
+      const el = e.currentTarget as HTMLElement;
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+
+      g.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (g.touches.size === 1) {
+        g.mode = "one";
+        g.startX = e.clientX;
+        g.startY = e.clientY;
+        g.moved = false;
+        g.longPressFired = false;
+        clearLongPress();
+
+        g.longPressTimer = window.setTimeout(() => {
+          if (g.mode !== "one") return;
+          if (g.moved) return;
+          if (g.touches.size !== 1) return;
+          g.longPressFired = true;
+          handlePointerAt(g.startX, g.startY, "remove");
+        }, LONG_PRESS_MS);
+
+        return;
+      }
+
+      // 2 finger => pan/zoom
+      clearLongPress();
+      g.mode = "two";
+      const pts = [...g.touches.values()];
+      const p0 = pts[0]!;
+      const p1 = pts[1]!;
+      g.pinchStartDist = Math.hypot(p0.x - p1.x, p0.y - p1.y);
+      const t = threeRef.current;
+      g.pinchStartZoom = t ? t.anim.zoom : 1;
+      g.lastMidX = (p0.x + p1.x) / 2;
+      g.lastMidY = (p0.y + p1.y) / 2;
+    }
+  };
+
+  const onPointerMove = (e: React.PointerEvent) => {
+    const g = gestureRef.current;
+
+    if (e.pointerType === "mouse") {
+      if (e.buttons === PAN_BUTTONS) {
+        e.preventDefault();
+        if (!g.mousePanning) {
+          g.mousePanning = true;
+          g.lastMouseX = e.clientX;
+          g.lastMouseY = e.clientY;
+          return;
+        }
+        const dx = e.clientX - g.lastMouseX;
+        const dy = e.clientY - g.lastMouseY;
+        g.lastMouseX = e.clientX;
+        g.lastMouseY = e.clientY;
+        panByPixels(dx, dy);
+        return;
+      }
+
+      if (g.mousePanning) g.mousePanning = false;
+      return;
+    }
+
+    if (e.pointerType === "touch") {
+      e.preventDefault();
+      if (!g.touches.has(e.pointerId)) return;
+      g.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+      if (g.touches.size === 1 && g.mode === "one") {
+        const dx = e.clientX - g.startX;
+        const dy = e.clientY - g.startY;
+        if (!g.moved && Math.hypot(dx, dy) > TAP_MOVE_PX) {
+          g.moved = true;
+          clearLongPress();
+        }
+        return;
+      }
+
+      if (g.touches.size >= 2) {
+        clearLongPress();
+        if (g.mode !== "two") {
+          g.mode = "two";
+          const pts = [...g.touches.values()];
+          const p0 = pts[0]!;
+          const p1 = pts[1]!;
+          g.pinchStartDist = Math.hypot(p0.x - p1.x, p0.y - p1.y);
+          const t = threeRef.current;
+          g.pinchStartZoom = t ? t.anim.zoom : 1;
+          g.lastMidX = (p0.x + p1.x) / 2;
+          g.lastMidY = (p0.y + p1.y) / 2;
+        }
+
+        const pts = [...g.touches.values()];
+        const p0 = pts[0]!;
+        const p1 = pts[1]!;
+        const midX = (p0.x + p1.x) / 2;
+        const midY = (p0.y + p1.y) / 2;
+        const dist = Math.hypot(p0.x - p1.x, p0.y - p1.y);
+
+        panByPixels(midX - g.lastMidX, midY - g.lastMidY);
+        g.lastMidX = midX;
+        g.lastMidY = midY;
+
+        const t = threeRef.current;
+        if (t && g.pinchStartDist > 2 && dist > 2) {
+          const factor = g.pinchStartDist / dist;
+          t.anim.zoom = clamp(g.pinchStartZoom * factor, 0.35, 3.0);
+        }
+      }
+    }
+  };
+
+  const onPointerUp = (e: React.PointerEvent) => {
+    const g = gestureRef.current;
+
+    if (e.pointerType === "mouse") {
+      if (g.mousePanning && e.buttons !== PAN_BUTTONS) g.mousePanning = false;
+      return;
+    }
+
+    if (e.pointerType === "touch") {
+      e.preventDefault();
+
+      if (g.mode === "one") {
+        clearLongPress();
+        if (!g.moved && !g.longPressFired) {
+          handlePointerAt(e.clientX, e.clientY, "add");
+        }
+      }
+
+      g.touches.delete(e.pointerId);
+
+      if (g.touches.size == 0) {
+        g.mode = "none";
+        g.moved = false;
+        g.longPressFired = false;
+        clearLongPress();
+        return;
+      }
+
+      if (g.touches.size == 1) {
+        // Prevent accidental tap/add after pinch.
+        g.mode = "one";
+        const p = [...g.touches.values()][0]!;
+        g.startX = p.x;
+        g.startY = p.y;
+        g.moved = true;
+        g.longPressFired = false;
+        clearLongPress();
+        return;
+      }
+
+      g.mode = "two";
+    }
+  };
+
 
   const rotateLeft = () => setYawIndex((v) => v - 1);
   const rotateRight = () => setYawIndex((v) => v + 1);
@@ -413,6 +779,8 @@ export default function PrintPrepViewer(props: {
   const showUp = pitchIndex < 2;
   const showDown = pitchIndex > -2;
 
+  const floatingTotal = floatingBase.size + floatingSupport.size;
+
   return (
     <div className="prepViewerRoot">
       <div
@@ -421,16 +789,12 @@ export default function PrintPrepViewer(props: {
         onContextMenu={(e) => {
           e.preventDefault();
         }}
-        onMouseDown={(e) => {
-          if (e.button === 2) return;
-          handlePointer(e, false);
-        }}
-        onMouseUp={(e) => {
-          if (e.button === 2) {
-            handlePointer(e, true);
-          }
-        }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
         onWheel={(e) => {
+          e.preventDefault();
           const t = threeRef.current;
           if (!t) return;
           const delta = Math.sign(e.deltaY);
@@ -439,14 +803,46 @@ export default function PrintPrepViewer(props: {
         }}
       />
 
-      <div className="prepHud">
-        <div className="prepHint">
-          クリック: 補完ブロック追加 / 右クリック: 補完ブロック削除
-          <br />
-          赤: 浮動 / 青: 補完
-        </div>
-        <div className="prepCounts">
-          ブロック: {baseBlocks.size}　補完: {extraBlocks.size}　浮動: {floating.size}
+      <div className={`prepHud ${isCompactHud ? "compact" : ""}`}>
+        {(!isCompactHud || showHelp) && (
+          <div className={`prepHint ${isCompactHud ? "compact" : ""}`}>
+            {isCompactHud ? (
+              <>
+                タップ: 補完(0.5)追加　長押し: 補完削除
+                <br />
+                2本指: 移動　ピンチ: ズーム
+                <br />
+                赤: 浮動 / 青: 補完
+              </>
+            ) : (
+              <>
+                クリック/タップ: 補完ブロック（0.5）追加　右クリック/長押し: 補完ブロック削除
+                <br />
+                中ボタン/2本指: 移動　ホイール/ピンチ: ズーム　Space: 中央へ
+                <br />
+                赤: 浮動 / 青: 補完
+              </>
+            )}
+          </div>
+        )}
+
+        <div className="prepCountsRow">
+          <div className="prepCounts">
+            ブロック: {baseBlocks.size}　補完: {supportBlocks.size}　浮動: {floatingTotal}
+            {floatingSupport.size > 0 && `（支柱:${floatingSupport.size}）`}
+          </div>
+
+          {isCompactHud && (
+            <button
+              type="button"
+              className={`miniToggle ${showHelp ? "on" : ""}`}
+              onClick={() => setShowHelp((v) => !v)}
+              title="操作"
+              aria-label="操作"
+            >
+              操作
+            </button>
+          )}
         </div>
       </div>
 

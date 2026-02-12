@@ -2,10 +2,26 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 
+import { computeMixedBBox } from "@/components/qbu/subBlocks";
+import {
+  estimatePrintPriceYen,
+  estimateSolidVolumeCm3,
+  formatMm,
+  formatYen,
+  resolvePrintScale,
+  type PrintScaleSetting,
+} from "@/components/qbu/printScale";
+
 type PrintDraft = {
   baseName: string;
+  /** legacy: max-side mm */
   targetMm: number;
+  /** v1.0.14+: print scale mode */
+  scaleSetting: PrintScaleSetting;
+  /** base blocks (1.0) */
   blocks: string[];
+  /** support blocks (0.5) */
+  supportBlocks: string[];
   created_at: number;
 };
 
@@ -29,10 +45,34 @@ export default function PrintPage() {
       const obj = JSON.parse(raw);
       if (!obj || typeof obj !== "object") return;
       if (!Array.isArray(obj.blocks)) return;
+
+      const baseName = typeof obj.baseName === "string" ? obj.baseName : "Q-BU";
+      const targetMm = typeof obj.targetMm === "number" ? obj.targetMm : 50;
+
+      const scaleSetting: PrintScaleSetting = (() => {
+        const s = (obj as any).scaleSetting;
+        if (s && typeof s === "object") {
+          if (s.mode === "maxSide" && typeof s.maxSideMm === "number") {
+            return { mode: "maxSide", maxSideMm: s.maxSideMm };
+          }
+          if (s.mode === "blockEdge" && typeof s.blockEdgeMm === "number") {
+            return { mode: "blockEdge", blockEdgeMm: s.blockEdgeMm };
+          }
+        }
+        // fallback (legacy)
+        return { mode: "maxSide", maxSideMm: targetMm };
+      })();
+
+      const supportBlocks: string[] = Array.isArray((obj as any).supportBlocks)
+        ? (obj as any).supportBlocks.filter((x: any) => typeof x === "string")
+        : [];
+
       setDraft({
-        baseName: typeof obj.baseName === "string" ? obj.baseName : "Q-BU",
-        targetMm: typeof obj.targetMm === "number" ? obj.targetMm : 50,
+        baseName,
+        targetMm,
+        scaleSetting,
         blocks: obj.blocks.filter((x: any) => typeof x === "string"),
+        supportBlocks,
         created_at: typeof obj.created_at === "number" ? obj.created_at : Date.now(),
       });
     } catch {
@@ -40,15 +80,56 @@ export default function PrintPage() {
     }
   }, []);
 
-  const summary = useMemo(() => {
-    if (!draft) return "";
-    return `モデル: ${draft.baseName} / ブロック数: ${draft.blocks.length} / サイズ: 最大辺 ${draft.targetMm}mm`;
+  const derived = useMemo(() => {
+    if (!draft) return null;
+    const baseSet = new Set(draft.blocks);
+    const supportSet = new Set(draft.supportBlocks);
+    const bbox = computeMixedBBox(baseSet, supportSet);
+    const resolved = resolvePrintScale({
+      bboxMaxDimWorld: bbox.maxDim,
+      setting: draft.scaleSetting,
+      clampMaxSideMm: { min: 10, max: 300 },
+      clampBlockEdgeMm: { min: 0.1, max: 500 },
+    });
+    const volume = estimateSolidVolumeCm3({
+      baseBlockCount: baseSet.size,
+      supportBlockCount: supportSet.size,
+      mmPerUnit: resolved.mmPerUnit,
+    });
+    const quote = estimatePrintPriceYen(volume);
+    return {
+      baseCount: baseSet.size,
+      supportCount: supportSet.size,
+      bbox,
+      resolved,
+      quote,
+    };
   }, [draft]);
+
+  const summary = useMemo(() => {
+    if (!draft || !derived) return "";
+    const sizeText =
+      derived.resolved.mode === "maxSide"
+        ? `最大辺 ${formatMm(derived.resolved.maxSideMm, 0)}mm（1ブロック辺 ${formatMm(
+            derived.resolved.mmPerUnit,
+            2
+          )}mm）`
+        : `1ブロック辺 ${formatMm(derived.resolved.mmPerUnit, 2)}mm（最大辺 ${formatMm(
+            derived.resolved.maxSideMm,
+            1
+          )}mm）`;
+    return `モデル: ${draft.baseName} / ブロック数: ${derived.baseCount}（補完 ${derived.supportCount}） / サイズ: ${sizeText}`;
+  }, [draft, derived]);
 
   const submit = async () => {
     setError("");
     if (!draft) {
       setError("印刷データがありません。エディターに戻って『印刷用にSTLを書き出す』から進んでください。");
+      return;
+    }
+
+    if (derived?.resolved.warnTooLarge) {
+      setError("最大辺が180mmを超えるため、印刷依頼できません。サイズを小さくしてください。");
       return;
     }
     if (!email.trim()) {
@@ -108,6 +189,24 @@ export default function PrintPage() {
         <div style={{ background: "#f9fafb", border: "1px solid rgba(0,0,0,0.08)", borderRadius: 12, padding: 12, marginBottom: 14 }}>
           <div style={{ fontWeight: 700 }}>内容</div>
           <div style={{ marginTop: 4 }}>{summary}</div>
+
+          {derived && (
+            <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
+              {derived.resolved.warnTooLarge && (
+                <div className="warnYellow">⚠ 最大辺が180mmを超えています（印刷依頼には大きすぎます）</div>
+              )}
+              <div style={{ fontSize: 12, color: "#6b7280", fontWeight: 700 }}>
+                概算見積（送料別）: <b>{formatYen(derived.quote.subtotalYen)}円</b> ／ 推定体積 {formatMm(
+                  derived.quote.volumeCm3,
+                  1
+                )}
+                cm³
+              </div>
+              <div style={{ fontSize: 12, color: "#6b7280", fontWeight: 700 }}>
+                ※概算です（造形方式・材料・肉厚・充填率で変動します）
+              </div>
+            </div>
+          )}
         </div>
       ) : (
         <div style={{ background: "#fff7ed", border: "1px solid rgba(0,0,0,0.08)", borderRadius: 12, padding: 12, marginBottom: 14 }}>
@@ -157,7 +256,7 @@ export default function PrintPage() {
         <button
           type="button"
           onClick={submit}
-          disabled={busy}
+          disabled={busy || Boolean(derived?.resolved.warnTooLarge)}
           style={{ padding: "10px 14px", borderRadius: 12, border: "1px solid rgba(0,0,0,0.18)", background: busy ? "#f3f4f6" : "#ecfccb", fontWeight: 800 }}
         >
           {busy ? "準備中..." : "Google Payで支払う"}

@@ -11,10 +11,12 @@ import PrintPrepModal from "@/components/qbu/PrintPrepModal";
 import { useTelemetry } from "@/components/telemetry/TelemetryProvider";
 import { useAuth } from "@/components/auth/AuthProvider";
 import { computeBBox, keyOf, parseKey } from "@/components/qbu/voxelUtils";
+import { computeMixedBBox, parseSubKey, subMinToWorldCenter, type SubKey } from "@/components/qbu/subBlocks";
 import { DEFAULT_REF_SETTINGS, type ViewDir } from "@/components/qbu/settings";
 import { DEFAULT_CUBE_COLOR } from "@/components/qbu/filamentColors";
 import { readFileAsDataURL, splitThreeViewSheet, type RefImages } from "@/components/qbu/referenceUtils";
 import { countComponents } from "@/components/qbu/printPrepUtils";
+import { resolvePrintScale, type PrintScaleSetting } from "@/components/qbu/printScale";
 
 const STORAGE_KEY = "qbu_project_v1";
 const DRAFT_KEY = "qbu_draft_v2";
@@ -166,7 +168,10 @@ export default function Builder() {
   // 印刷用補完
   const [prepOpen, setPrepOpen] = useState(false);
   const [prepName, setPrepName] = useState("Q-BU");
-  const [prepTargetMm, setPrepTargetMm] = useState(DEFAULT_TARGET_MM);
+  const [prepScaleSetting, setPrepScaleSetting] = useState<PrintScaleSetting>({
+    mode: "maxSide",
+    maxSideMm: DEFAULT_TARGET_MM,
+  });
 
   // ログイン後に“保存画面を自動で開く”ための復元
   useEffect(() => {
@@ -237,41 +242,63 @@ export default function Builder() {
     downloadBlob(new Blob([JSON.stringify(data)], { type: "application/json" }), `${baseName}_project.json`);
   };
 
-  const exportStlFromBlocks = (baseName: string, targetMm: number, keys: Set<string>) => {
+  const exportStlFromBlocks = (
+    baseName: string,
+    scaleSetting: PrintScaleSetting,
+    baseKeys: Set<string>,
+    supportKeys: Set<SubKey>
+  ) => {
     if (!user) {
       requireLogin("保存するにはログインが必要です。");
       return;
     }
 
-    const bboxNow = computeBBox(keys);
+    const bboxNow = computeMixedBBox(baseKeys, supportKeys);
+    const resolved = resolvePrintScale({
+      bboxMaxDimWorld: bboxNow.maxDim,
+      setting: scaleSetting,
+      clampMaxSideMm: { min: 10, max: 300 },
+      clampBlockEdgeMm: { min: 0.1, max: 500 },
+    });
 
     // 出力用の group（参照画像なし）
     const outRoot = new THREE.Group();
 
-    // 中心を原点へ
+    // 中心を原点へ（mixed bbox）
     outRoot.position.set(-bboxNow.center.x, -bboxNow.center.y, -bboxNow.center.z);
 
-    // 指定mmに収まるようスケール（最大辺を targetMm に合わせる）
-    const target = clamp(Math.round(targetMm || DEFAULT_TARGET_MM), 10, 300);
-    const s = target / Math.max(1, bboxNow.maxDim);
+    // STLの単位=mmとして出力するため、world unit を mmPerUnit 倍する
+    const s = resolved.mmPerUnit;
     outRoot.scale.set(s, s, s);
 
     track("project_export_stl", {
-      blocks: keys.size,
+      blocks: baseKeys.size,
+      supports: supportKeys.size,
       max_dim: bboxNow.maxDim,
-      target_mm: target,
-      scale: s,
+      scale_mode: resolved.mode,
+      max_side_mm: resolved.maxSideMm,
+      mm_per_unit: resolved.mmPerUnit,
     });
 
     const outCubes = new THREE.Group();
     outRoot.add(outCubes);
 
-    const geo = new THREE.BoxGeometry(1, 1, 1);
+    const geoBase = new THREE.BoxGeometry(1, 1, 1);
+    const geoSupport = new THREE.BoxGeometry(0.5, 0.5, 0.5);
     const mat = new THREE.MeshStandardMaterial({ color: new THREE.Color("#ffffff") });
 
-    for (const k of keys) {
+    // base cubes
+    for (const k of baseKeys) {
       const c = parseKey(k);
-      const mesh = new THREE.Mesh(geo, mat);
+      const mesh = new THREE.Mesh(geoBase, mat);
+      mesh.position.set(c.x, c.y, c.z);
+      outCubes.add(mesh);
+    }
+
+    // half-size support cubes
+    for (const sk of supportKeys) {
+      const c = subMinToWorldCenter(parseSubKey(sk));
+      const mesh = new THREE.Mesh(geoSupport, mat);
       mesh.position.set(c.x, c.y, c.z);
       outCubes.add(mesh);
     }
@@ -281,14 +308,15 @@ export default function Builder() {
     const exporter = new STLExporter();
     const stl = exporter.parse(outRoot, { binary: true }) as ArrayBuffer;
 
-    track("project_save_download", { kind: "stl", target_mm: target });
+    track("project_save_download", { kind: "stl", max_side_mm: resolved.maxSideMm, mode: resolved.mode });
     downloadBlob(new Blob([stl], { type: "model/stl" }), `${baseName}.stl`);
 
-    geo.dispose();
+    geoBase.dispose();
+    geoSupport.dispose();
     mat.dispose();
   };
 
-  const exportStlDirect = (baseName: string, targetMm: number) => {
+  const exportStlDirect = (baseName: string, scaleSetting: PrintScaleSetting) => {
     if (!user) {
       requireLogin("保存するにはログインが必要です。");
       return;
@@ -304,7 +332,7 @@ export default function Builder() {
       if (!ok) return;
     }
 
-    exportStlFromBlocks(baseName, targetMm, blocks);
+    exportStlFromBlocks(baseName, scaleSetting, blocks, new Set());
   };
 
   const handleImportThreeView = async (file: File) => {
@@ -394,16 +422,40 @@ export default function Builder() {
     }
   };
 
-  const requestPrintFlow = (baseName: string, targetMm: number, keys: Set<string>) => {
+  const requestPrintFlow = (
+    baseName: string,
+    scaleSetting: PrintScaleSetting,
+    baseKeys: Set<string>,
+    supportKeys: Set<SubKey>
+  ) => {
     // ひとまず“印刷依頼ページへ遷移”できるところまで用意
     // 実決済（GooglePay）は /print 側で Stripe 等の設定が必要
+    const bboxNow = computeMixedBBox(baseKeys, supportKeys);
+    const resolved = resolvePrintScale({
+      bboxMaxDimWorld: bboxNow.maxDim,
+      setting: scaleSetting,
+      clampMaxSideMm: { min: 10, max: 300 },
+      clampBlockEdgeMm: { min: 0.1, max: 500 },
+    });
+
+    const finalSetting: PrintScaleSetting =
+      resolved.mode === "maxSide"
+        ? { mode: "maxSide", maxSideMm: resolved.maxSideMm }
+        : { mode: "blockEdge", blockEdgeMm: resolved.mmPerUnit };
+
     try {
       sessionStorage.setItem(
         PRINT_DRAFT_KEY,
         JSON.stringify({
-          name: baseName,
-          target_mm: targetMm,
-          blocks: Array.from(keys),
+          baseName,
+          // legacy (print/page.tsx v1 expects targetMm)
+          targetMm: resolved.maxSideMm,
+          // v1.0.14+ (scale toggle)
+          scaleSetting: finalSetting,
+          // backward compatible field name (print/page.tsx expects `blocks`)
+          blocks: Array.from(baseKeys),
+          // v1.0.14+ (0.5 supports)
+          supportBlocks: Array.from(supportKeys),
           created_at: Date.now(),
         })
       );
@@ -413,7 +465,6 @@ export default function Builder() {
 
     window.location.href = "/print";
   };
-
   const cubeCount = blocks.size;
 
   return (
@@ -494,17 +545,17 @@ export default function Builder() {
           downloadProject(name);
           setSaveOpen(false);
         }}
-        onExportStl={(name, mm) => {
-          exportStlDirect(name, mm);
+        onExportStl={(name, setting) => {
+          exportStlDirect(name, setting);
           setSaveOpen(false);
         }}
-        onOpenPrintPrep={(name, mm) => {
+        onOpenPrintPrep={(name, setting) => {
           if (!user) {
             requireLogin("保存するにはログインが必要です。");
             return;
           }
           setPrepName(name);
-          setPrepTargetMm(mm);
+          setPrepScaleSetting(setting);
           setPrepOpen(true);
           setSaveOpen(false);
         }}
@@ -513,15 +564,15 @@ export default function Builder() {
       <PrintPrepModal
         open={prepOpen}
         baseName={prepName}
-        targetMm={prepTargetMm}
+        scaleSetting={prepScaleSetting}
         baseBlocks={blocks}
         onClose={() => setPrepOpen(false)}
-        onExport={(name, mm, keys) => {
-          exportStlFromBlocks(name, mm, keys);
+        onExport={(name, setting, baseKeys, supportKeys) => {
+          exportStlFromBlocks(name, setting, baseKeys, supportKeys);
           setPrepOpen(false);
         }}
-        onRequestPrint={(name, mm, keys) => {
-          requestPrintFlow(name, mm, keys);
+        onRequestPrint={(name, setting, baseKeys, supportKeys) => {
+          requestPrintFlow(name, setting, baseKeys, supportKeys);
         }}
       />
     </div>

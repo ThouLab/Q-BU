@@ -32,6 +32,18 @@ canvas {
   display: block;
 }
 
+/* Prevent browser gestures from interfering with 3D input */
+canvas {
+  touch-action: none;
+}
+
+.canvasWrap,
+.previewCanvasWrap,
+.prepCanvasWrap {
+  touch-action: none;
+  overscroll-behavior: none;
+}
+
 .page {
   height: 100vh;
   display: flex;
@@ -199,6 +211,46 @@ canvas {
   user-select: none;
 }
 
+/* Mobile: keep the hint readable when expanded */
+.editorHint.compact {
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(11, 15, 24, 0.12);
+  border-radius: 12px;
+  padding: 8px 10px;
+  backdrop-filter: blur(6px);
+  color: rgba(11, 15, 24, 0.72);
+}
+
+.hudCompactRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.hudPill {
+  border: 1px solid rgba(11, 15, 24, 0.12);
+  background: rgba(255, 255, 255, 0.65);
+  backdrop-filter: blur(6px);
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-weight: 900;
+  font-size: 12px;
+  line-height: 1;
+  color: rgba(11, 15, 24, 0.55);
+  user-select: none;
+}
+
+.colorDot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(11, 15, 24, 0.18);
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+
 .editorHudActions {
   display: flex;
   gap: 8px;
@@ -222,6 +274,13 @@ canvas {
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.65);
   backdrop-filter: blur(6px);
+  max-width: min(520px, 78vw);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.swatches::-webkit-scrollbar {
+  height: 0;
 }
 
 .swatch {
@@ -327,6 +386,7 @@ canvas {
 }
 
 .triBtn {
+  --btnTransform: none;
   pointer-events: auto;
   position: absolute;
   width: 78px;
@@ -340,6 +400,7 @@ canvas {
   cursor: pointer;
   transition: transform 0.08s ease, background 0.12s ease;
   user-select: none;
+  transform: var(--btnTransform);
 }
 
 .triBtn:hover {
@@ -347,7 +408,7 @@ canvas {
 }
 
 .triBtn:active {
-  transform: scale(0.98);
+  transform: var(--btnTransform) scale(0.98);
 }
 
 .tri {
@@ -380,25 +441,25 @@ canvas {
 .posUp {
   top: 14px;
   left: 50%;
-  transform: translateX(-50%);
+  --btnTransform: translateX(-50%);
 }
 
 .posDown {
   bottom: 14px;
   left: 50%;
-  transform: translateX(-50%);
+  --btnTransform: translateX(-50%);
 }
 
 .posLeft {
   left: 14px;
   top: 50%;
-  transform: translateY(-50%);
+  --btnTransform: translateY(-50%);
 }
 
 .posRight {
   right: 14px;
   top: 50%;
-  transform: translateY(-50%);
+  --btnTransform: translateY(-50%);
 }
 
 /* ===== Preview HUD (inside preview) ===== */
@@ -456,8 +517,14 @@ canvas {
 @media (max-width: 900px) {
   .workspace {
     grid-template-columns: 1fr;
-    grid-template-rows: 260px 1fr;
+    grid-template-rows: clamp(180px, 32vh, 320px) 1fr;
   }
+
+  /* When the preview pane is closed, the editor should take the full height. */
+  .workspace.previewClosed {
+    grid-template-rows: 1fr;
+  }
+
   .previewPane {
     border-right: none;
     border-bottom: 1px solid var(--border);
@@ -882,6 +949,18 @@ canvas {
   font-weight: 800;
 }
 
+/* Yellow warning (e.g., print size too large) */
+.warnYellow {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 1000;
+  color: rgba(146, 64, 14, 0.95);
+  background: rgba(254, 249, 195, 0.95);
+  border: 1px solid rgba(234, 179, 8, 0.45);
+  border-radius: 12px;
+  padding: 7px 10px;
+}
+
 .saveActions {
   margin-top: 12px;
   display: flex;
@@ -975,6 +1054,22 @@ canvas {
   color: #374151;
 }
 
+.prepCountsRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+@media (max-width: 600px) {
+  .prepHud {
+    max-width: calc(100vw - 20px);
+  }
+  .prepCounts {
+    margin-top: 0;
+  }
+}
+
 .prepFooter {
   display: flex;
   gap: 12px;
@@ -1013,3 +1108,49 @@ canvas {
 
 .prepViewerRoot { position: absolute; inset: 0; }
 
+
+
+@media (max-width: 600px) {
+  .prepOverlay {
+    padding: 0;
+  }
+  .prepCard {
+    width: 100vw;
+    height: 100vh;
+    border-radius: 0;
+  }
+}
+
+@media (max-width: 520px) {
+  .triBtn {
+    width: 64px;
+    height: 64px;
+    border-radius: 16px;
+  }
+  .zoomBtn {
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+  }
+  .zoomStack {
+    right: 10px;
+    bottom: 10px;
+    gap: 6px;
+  }
+  .posUp {
+    top: 10px;
+  }
+  .posDown {
+    bottom: 10px;
+  }
+  .posLeft {
+    left: 10px;
+  }
+  .posRight {
+    right: 10px;
+  }
+  .editorHud {
+    top: 10px;
+    left: 10px;
+  }
+}

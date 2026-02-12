@@ -17,11 +17,10 @@ function initialsFromEmail(email: string) {
  * - ほかの機能（同意など）はここでは扱わない
  */
 export default function AccountFab() {
-  const { supabase, user, signInWithGoogle, signInWithEmail, signOut } = useAuth();
+  const { supabase, user, signInWithGoogle, signOut } = useAuth();
   const { track } = useTelemetry();
 
   const [open, setOpen] = useState(false);
-  const [email, setEmail] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
 
   const configured = Boolean(supabase);
@@ -59,13 +58,34 @@ export default function AccountFab() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  const sendEmail = async () => {
-    setMsg(null);
-    const domain = (email.split("@")[1] || "").slice(0, 64);
-    track("auth_email_start", { domain });
-    const res = await signInWithEmail(email);
-    track("auth_email_result", { ok: res.ok });
-    setMsg(res.message ?? null);
+  const isEmbedded = useMemo(() => {
+    if (typeof navigator === "undefined") return false;
+    const ua = navigator.userAgent || "";
+    // Android WebView: `wv` or `Version/4.0`
+    const isAndroidWebView = /\bwv\b/i.test(ua) || /Version\/4\.0/i.test(ua);
+    // iOS WebView: iOS device but not Safari/Chrome/Firefox/Edge
+    const isiOS = /iPhone|iPad|iPod/i.test(ua);
+    const isSafari = /Safari/i.test(ua);
+    const isCriOS = /CriOS/i.test(ua);
+    const isFxiOS = /FxiOS/i.test(ua);
+    const isEdgiOS = /EdgiOS/i.test(ua);
+    const isiOSWebView = isiOS && !isSafari && !isCriOS && !isFxiOS && !isEdgiOS;
+    // Common in-app browsers
+    const isInApp = /FBAN|FBAV|Instagram|Line|Twitter|Snapchat|WhatsApp/i.test(ua);
+    return isAndroidWebView || isiOSWebView || isInApp;
+  }, []);
+
+  const openInBrowser = async () => {
+    try {
+      const url = window.location.href;
+      const w = window.open(url, "_blank", "noopener,noreferrer");
+      if (w) return;
+      // Popup blocked: try copy as a fallback
+      await navigator.clipboard?.writeText?.(url);
+      setMsg("リンクをコピーしました。Chrome/Safariで貼り付けて開いてください。");
+    } catch {
+      setMsg("Chrome/Safariなどのブラウザで開き直してからログインしてください。");
+    }
   };
 
   return (
@@ -113,22 +133,29 @@ export default function AccountFab() {
                 </button>
               </div>
 
-              <div className="accountDivider" />
+              {isEmbedded && (
+                <>
+                  <div className="accountDivider" />
+                  <div className="accountMuted">
+                    アプリ内ブラウザ（WebView）では、Googleログインがブロックされる場合があります。
+                    <br />
+                    Chrome/Safariで開き直してからログインしてください。
+                  </div>
+                  <div className="accountRow">
+                    <button
+                      type="button"
+                      className="accountBtn"
+                      onClick={() => {
+                        track("auth_open_external_browser");
+                        openInBrowser();
+                      }}
+                    >
+                      ブラウザで開く
+                    </button>
+                  </div>
+                </>
+              )}
 
-              <div className="accountRow">
-                <input
-                  className="accountInput"
-                  placeholder="メールアドレス"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  type="email"
-                  inputMode="email"
-                  autoComplete="email"
-                />
-                <button type="button" className="accountBtn" onClick={sendEmail}>
-                  送信
-                </button>
-              </div>
               {msg && <div className="accountMuted">{msg}</div>}
               {!msg && <div className="accountMuted">保存・エクスポートにはログインが必要です。</div>}
             </>

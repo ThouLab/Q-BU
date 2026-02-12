@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 
 import AccountFab from "@/components/account/AccountFab";
@@ -92,6 +92,7 @@ type EditorThree = {
   highlightPlane: any;
   previewCube: any;
   light: any;
+  grid: any;
 
   audioCtx: AudioContext | null;
 
@@ -118,7 +119,7 @@ type EditorThree = {
   edgeMat: any;
 
   // camera animation / zoom
-  anim: { yaw: number; pitch: number; baseRadius: number; zoom: number };
+  anim: { yaw: number; pitch: number; baseRadius: number; zoom: number; center: Coord };
 };
 
 function makePixelTexture(url: string) {
@@ -197,6 +198,30 @@ export default function VoxelEditor({
   useEffect(() => {
     trackRef.current = track;
   }, [track]);
+
+  // --- HUD: モバイルでは情報量を抑える（PCは従来どおり） ---
+  const [isCompactHud, setIsCompactHud] = useState(false);
+  const [showHelp, setShowHelp] = useState(true);
+  const [showLook, setShowLook] = useState(true);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 600px)");
+    const apply = () => setIsCompactHud(mq.matches);
+    apply();
+    mq.addEventListener?.("change", apply);
+    return () => mq.removeEventListener?.("change", apply);
+  }, []);
+
+  useEffect(() => {
+    // スマホはデフォルトで「ヘルプ/見た目」を畳む
+    if (isCompactHud) {
+      setShowHelp(false);
+      setShowLook(false);
+    } else {
+      setShowHelp(true);
+      setShowLook(true);
+    }
+  }, [isCompactHud]);
 
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const threeRef = useRef<EditorThree | null>(null);
@@ -344,6 +369,12 @@ export default function VoxelEditor({
     // center to origin
     t.root.position.set(-bboxNow.center.x, -bboxNow.center.y, -bboxNow.center.z);
 
+    // Keep the grid at the model's bottom face (dynamic).
+    // With root centered at origin, the bottom face becomes -sizeY/2.
+    if (t.grid) {
+      t.grid.position.y = -bboxNow.size.y / 2 - 0.001;
+    }
+
     // clear old cubes (shared resourcesなのでdisposeしない)
     t.cubesGroup.clear();
 
@@ -408,7 +439,8 @@ export default function VoxelEditor({
     const grid = new THREE.GridHelper(60, 60, new THREE.Color("#d7dde8"), new THREE.Color("#eef2f7"));
     (grid.material as any).transparent = true;
     (grid.material as any).opacity = 0.7;
-    grid.position.y = -6;
+    // Grid height will be updated dynamically to match the model's bottom face.
+    grid.position.y = -0.5;
     scene.add(grid);
 
     // root group (centered)
@@ -491,6 +523,7 @@ export default function VoxelEditor({
       highlightPlane,
       previewCube,
       light,
+      grid,
       audioCtx: null,
       refPlanes: {},
       refTextures: {},
@@ -505,6 +538,7 @@ export default function VoxelEditor({
         pitch: ipitch,
         baseRadius: initialRadius,
         zoom: 1,
+        center: { x: 0, y: 0, z: 0 },
       },
     };
 
@@ -525,17 +559,28 @@ export default function VoxelEditor({
     const ro = new ResizeObserver(() => onResize());
     ro.observe(wrap);
 
-    const toNDC = (ev: PointerEvent) => {
+    // Disable browser gestures on the canvas (for mobile pinch/pan)
+    renderer.domElement.style.touchAction = "none";
+
+    const toNDCXY = (clientX: number, clientY: number) => {
       const rect = renderer.domElement.getBoundingClientRect();
-      mouse.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-      mouse.y = -(((ev.clientY - rect.top) / rect.height) * 2 - 1);
+      mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -(((clientY - rect.top) / rect.height) * 2 - 1);
     };
 
-    const updateHover = (ev: PointerEvent) => {
+    const clearHover = () => {
+      const t = threeRef.current;
+      if (!t) return;
+      t.highlightPlane.visible = false;
+      t.previewCube.visible = false;
+      hoverRef.current = null;
+    };
+
+    const updateHoverAt = (clientX: number, clientY: number) => {
       const t = threeRef.current;
       if (!t) return;
 
-      toNDC(ev);
+      toNDCXY(clientX, clientY);
       t.raycaster.setFromCamera(t.mouse, t.camera);
 
       const hits = t.raycaster.intersectObjects(t.cubesGroup.children, false);
@@ -577,7 +622,9 @@ export default function VoxelEditor({
       t.previewCube.visible = true;
     };
 
-    const addAtHover = () => {
+    const addAt = (clientX: number, clientY: number) => {
+      updateHoverAt(clientX, clientY);
+
       const target = hoverRef.current;
       if (!target) return;
 
@@ -594,11 +641,11 @@ export default function VoxelEditor({
       if (ac) playPop(ac);
     };
 
-    const removeAtHit = (ev: PointerEvent) => {
+    const removeAt = (clientX: number, clientY: number) => {
       const t = threeRef.current;
       if (!t) return;
 
-      toNDC(ev);
+      toNDCXY(clientX, clientY);
       t.raycaster.setFromCamera(t.mouse, t.camera);
       const hits = t.raycaster.intersectObjects(t.cubesGroup.children, false);
       if (hits.length === 0) return;
@@ -620,29 +667,262 @@ export default function VoxelEditor({
       if (ac) playClick(ac);
     };
 
-    const onPointerMove = (ev: PointerEvent) => updateHover(ev);
+    const panByPixels = (dx: number, dy: number) => {
+      const t = threeRef.current;
+      if (!t) return;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const w = Math.max(1, rect.width);
+      const h = Math.max(1, rect.height);
+
+      const center = new THREE.Vector3(t.anim.center.x, t.anim.center.y, t.anim.center.z);
+      const dist = t.camera.position.distanceTo(center);
+      const fov = (t.camera.fov * Math.PI) / 180;
+      const worldPerPixelY = (2 * dist * Math.tan(fov / 2)) / h;
+      const worldPerPixelX = worldPerPixelY * (w / h);
+
+      const forward = new THREE.Vector3();
+      t.camera.getWorldDirection(forward);
+      const upWorld = new THREE.Vector3(0, 1, 0).applyQuaternion(t.camera.quaternion).normalize();
+      const rightWorld = new THREE.Vector3().crossVectors(forward, upWorld).normalize();
+
+      const delta = new THREE.Vector3()
+        .addScaledVector(rightWorld, -dx * worldPerPixelX)
+        .addScaledVector(upWorld, dy * worldPerPixelY);
+
+      t.anim.center = {
+        x: t.anim.center.x + delta.x,
+        y: t.anim.center.y + delta.y,
+        z: t.anim.center.z + delta.z,
+      };
+    };
+
+    const PAN_BUTTONS = 4; // mouse middle button
+    const TAP_MOVE_PX = 8;
+    const LONG_PRESS_MS = 480;
+
+    let mousePanning = false;
+    let lastMouseX = 0;
+    let lastMouseY = 0;
+
+    const touch = {
+      pointers: new Map<number, { x: number; y: number }>(),
+      mode: "none" as "none" | "one" | "two",
+      startX: 0,
+      startY: 0,
+      moved: false,
+      longPressTimer: 0 as any,
+      longPressFired: false,
+      pinchStartDist: 0,
+      pinchStartZoom: 1,
+      lastMidX: 0,
+      lastMidY: 0,
+    };
+
+    const clearLongPress = () => {
+      if (touch.longPressTimer) {
+        window.clearTimeout(touch.longPressTimer);
+        touch.longPressTimer = 0;
+      }
+    };
+
+    const beginTwoFinger = () => {
+      const pts = [...touch.pointers.values()];
+      if (pts.length < 2) return;
+      const p0 = pts[0]!;
+      const p1 = pts[1]!;
+      touch.mode = "two";
+      touch.pinchStartDist = Math.hypot(p0.x - p1.x, p0.y - p1.y);
+      const t = threeRef.current;
+      touch.pinchStartZoom = t ? t.anim.zoom : 1;
+      touch.lastMidX = (p0.x + p1.x) / 2;
+      touch.lastMidY = (p0.y + p1.y) / 2;
+      clearHover();
+    };
 
     const onPointerDown = (ev: PointerEvent) => {
       // audio unlock
       requestAudioContext();
 
-      // right click => delete
-      if (ev.button === 2) {
-        ev.preventDefault();
-        removeAtHit(ev);
+      if (ev.pointerType === "mouse") {
+        // middle button drag => pan
+        if (ev.button === 1) {
+          ev.preventDefault();
+          mousePanning = true;
+          lastMouseX = ev.clientX;
+          lastMouseY = ev.clientY;
+          clearHover();
+          return;
+        }
+
+        // right click => delete (only when right button alone)
+        if (ev.button === 2) {
+          if (ev.buttons === 2) {
+            ev.preventDefault();
+            removeAt(ev.clientX, ev.clientY);
+          }
+          return;
+        }
+
+        // left click => add (only when left button alone)
+        if (ev.button === 0 && ev.buttons === 1) {
+          addAt(ev.clientX, ev.clientY);
+        }
         return;
       }
 
-      // left click => add
-      if (ev.button === 0) addAtHover();
+      if (ev.pointerType === "touch") {
+        ev.preventDefault();
+        try {
+          renderer.domElement.setPointerCapture(ev.pointerId);
+        } catch {
+          // ignore
+        }
+
+        touch.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+        if (touch.pointers.size === 1) {
+          touch.mode = "one";
+          touch.startX = ev.clientX;
+          touch.startY = ev.clientY;
+          touch.moved = false;
+          touch.longPressFired = false;
+          clearLongPress();
+          updateHoverAt(ev.clientX, ev.clientY);
+
+          touch.longPressTimer = window.setTimeout(() => {
+            if (touch.mode !== "one") return;
+            if (touch.moved) return;
+            if (touch.pointers.size !== 1) return;
+            touch.longPressFired = true;
+            removeAt(touch.startX, touch.startY);
+            clearHover();
+          }, LONG_PRESS_MS);
+
+          return;
+        }
+
+        // 2 finger => pan/zoom
+        clearLongPress();
+        beginTwoFinger();
+      }
+    };
+
+    const onPointerMove = (ev: PointerEvent) => {
+      if (ev.pointerType === "mouse") {
+        // 3 buttons => pan
+        if (ev.buttons === PAN_BUTTONS) {
+          ev.preventDefault();
+          if (!mousePanning) {
+            mousePanning = true;
+            lastMouseX = ev.clientX;
+            lastMouseY = ev.clientY;
+            clearHover();
+            return;
+          }
+          const dx = ev.clientX - lastMouseX;
+          const dy = ev.clientY - lastMouseY;
+          lastMouseX = ev.clientX;
+          lastMouseY = ev.clientY;
+          panByPixels(dx, dy);
+          return;
+        }
+        if (mousePanning) mousePanning = false;
+
+        updateHoverAt(ev.clientX, ev.clientY);
+        return;
+      }
+
+      if (ev.pointerType === "touch") {
+        ev.preventDefault();
+        if (!touch.pointers.has(ev.pointerId)) return;
+        touch.pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+        if (touch.pointers.size === 1 && touch.mode === "one") {
+          const dx = ev.clientX - touch.startX;
+          const dy = ev.clientY - touch.startY;
+          if (!touch.moved && Math.hypot(dx, dy) > TAP_MOVE_PX) {
+            touch.moved = true;
+            clearLongPress();
+          }
+          updateHoverAt(ev.clientX, ev.clientY);
+          return;
+        }
+
+        // two-finger gesture
+        if (touch.pointers.size >= 2) {
+          clearLongPress();
+          if (touch.mode !== "two") beginTwoFinger();
+
+          const pts = [...touch.pointers.values()];
+          const p0 = pts[0]!;
+          const p1 = pts[1]!;
+          const midX = (p0.x + p1.x) / 2;
+          const midY = (p0.y + p1.y) / 2;
+          const dist = Math.hypot(p0.x - p1.x, p0.y - p1.y);
+
+          // pan by midpoint delta
+          panByPixels(midX - touch.lastMidX, midY - touch.lastMidY);
+          touch.lastMidX = midX;
+          touch.lastMidY = midY;
+
+          // pinch zoom
+          const t = threeRef.current;
+          if (t && touch.pinchStartDist > 2 && dist > 2) {
+            const factor = touch.pinchStartDist / dist; // pinch-out => zoom in (factor < 1)
+            t.anim.zoom = clamp(touch.pinchStartZoom * factor, 0.35, 3.2);
+          }
+
+          clearHover();
+        }
+      }
+    };
+
+    const onPointerUp = (ev: PointerEvent) => {
+      if (ev.pointerType === "mouse") {
+        if (mousePanning && ev.buttons !== PAN_BUTTONS) mousePanning = false;
+        return;
+      }
+
+      if (ev.pointerType === "touch") {
+        ev.preventDefault();
+
+        if (touch.mode === "one") {
+          clearLongPress();
+          if (!touch.moved && !touch.longPressFired) {
+            addAt(ev.clientX, ev.clientY);
+          }
+        }
+
+        touch.pointers.delete(ev.pointerId);
+
+        if (touch.pointers.size === 0) {
+          touch.mode = "none";
+          touch.moved = false;
+          touch.longPressFired = false;
+          clearLongPress();
+          return;
+        }
+
+        if (touch.pointers.size === 1) {
+          // After a 2-finger gesture, prevent accidental tap/add.
+          touch.mode = "one";
+          const p = [...touch.pointers.values()][0]!;
+          touch.startX = p.x;
+          touch.startY = p.y;
+          touch.moved = true;
+          touch.longPressFired = false;
+          clearLongPress();
+          clearHover();
+          return;
+        }
+
+        touch.mode = "two";
+      }
     };
 
     const onPointerLeave = () => {
-      const t = threeRef.current;
-      if (!t) return;
-      t.highlightPlane.visible = false;
-      t.previewCube.visible = false;
-      hoverRef.current = null;
+      // Hover only makes sense for mouse
+      if (touch.mode === "none") clearHover();
     };
 
     const onContextMenu = (ev: MouseEvent) => {
@@ -651,11 +931,10 @@ export default function VoxelEditor({
 
     let lastWheelLog = 0;
     const onWheel = (ev: WheelEvent) => {
-      // マウスホイールでズーム（編集がしやすい）
       ev.preventDefault();
       const t = threeRef.current;
       if (!t) return;
-      const factor = ev.deltaY > 0 ? 1.12 : 0.88; // 下スクロール=引く / 上スクロール=寄る
+      const factor = ev.deltaY > 0 ? 1.12 : 0.88;
       t.anim.zoom = clamp(t.anim.zoom * factor, 0.35, 3.2);
 
       const now = Date.now();
@@ -665,13 +944,29 @@ export default function VoxelEditor({
       }
     };
 
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.code !== "Space" && ev.key !== " ") return;
+      const target = ev.target as any;
+      const tag = (target?.tagName ?? "").toString().toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) return;
+
+      ev.preventDefault();
+      const t = threeRef.current;
+      if (!t) return;
+      t.anim.center = { x: 0, y: 0, z: 0 };
+      clearHover();
+    };
+
     renderer.domElement.addEventListener("pointermove", onPointerMove);
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
+    renderer.domElement.addEventListener("pointerup", onPointerUp);
+    renderer.domElement.addEventListener("pointercancel", onPointerUp);
     renderer.domElement.addEventListener("pointerleave", onPointerLeave);
     renderer.domElement.addEventListener("contextmenu", onContextMenu);
     renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("keydown", onKeyDown);
 
-    // animation loop
+// animation loop
     let raf = 0;
     const tick = () => {
       const t = threeRef.current;
@@ -688,9 +983,10 @@ export default function VoxelEditor({
       const sy2 = Math.sin(yaw);
       const cy2 = Math.cos(yaw);
 
-      const desired = new THREE.Vector3(targetR * cp2 * sy2, targetR * sp2, targetR * cp2 * cy2);
+      const c = t.anim.center;
+      const desired = new THREE.Vector3(c.x + targetR * cp2 * sy2, c.y + targetR * sp2, c.z + targetR * cp2 * cy2);
       t.camera.position.lerp(desired, 0.16);
-      t.camera.lookAt(0, 0, 0);
+      t.camera.lookAt(c.x, c.y, c.z);
 
       // light follows gently
       t.light.position.lerp(new THREE.Vector3(desired.x + 6, desired.y + 10, desired.z + 6), 0.06);
@@ -704,9 +1000,12 @@ export default function VoxelEditor({
       ro.disconnect();
       renderer.domElement.removeEventListener("pointermove", onPointerMove);
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
+      renderer.domElement.removeEventListener("pointerup", onPointerUp);
+      renderer.domElement.removeEventListener("pointercancel", onPointerUp);
       renderer.domElement.removeEventListener("pointerleave", onPointerLeave);
       renderer.domElement.removeEventListener("contextmenu", onContextMenu);
       renderer.domElement.removeEventListener("wheel", onWheel);
+      window.removeEventListener("keydown", onKeyDown);
 
       cancelAnimationFrame(raf);
 
@@ -826,47 +1125,105 @@ export default function VoxelEditor({
     >
       <div className="canvasWrap" ref={wrapRef} />
 
-      {/* 左上：最低限の案内（うっすら） */}
-      <div className="editorHud">
-        <div className="editorHint">
-          クリック: 追加 / 右クリック: 削除
-          <br />
-          ブロック: {cubeCount}
-        </div>
-
-        {/* 色とエッジ（最小UI） */}
-        <div className="editorHudTools" aria-label="色とエッジ">
-          <div className="swatches" aria-label="色">
-            {BAMBU_FILAMENT_COLORS.map((c) => (
-              <button
-                key={c.name}
-                type="button"
-                className={`swatch ${cubeColor.toLowerCase() === c.hex.toLowerCase() ? "selected" : ""}`}
-                title={c.name}
-                aria-label={c.name}
-                onClick={() => {
-                  setCubeColor(c.hex);
-                  track("color_change", { name: c.name, hex: c.hex });
-                }}
-                style={{ background: c.hex }}
-              />
-            ))}
+      {/* 左上：案内・色（スマホは折りたたみ） */}
+      
+      <div className={`editorHud ${isCompactHud ? "compact" : ""}`}>
+        {(!isCompactHud || showHelp) && (
+          <div className={`editorHint ${isCompactHud ? "compact" : ""}`}>
+            {isCompactHud ? (
+              <>
+                タップ: 追加　長押し: 削除
+                <br />
+                2本指: 移動　ピンチ: ズーム
+              </>
+            ) : (
+              <>
+                クリック/タップ: 追加　右クリック/長押し: 削除
+                <br />
+                中ボタン/2本指: 移動　ホイール/ピンチ: ズーム　Space: 中央へ
+                <br />
+                ブロック: {cubeCount}
+              </>
+            )}
           </div>
-          <button
-            type="button"
-            className={`miniToggle ${showEdges ? "on" : ""}`}
-            onClick={() =>
-              setShowEdges((v) => {
-                const next = !v;
-                track("edges_toggle", { on: next });
-                return next;
-              })
-            }
-            title="エッジ"
-            aria-label="エッジ"
-          >
-            エッジ
-          </button>
+        )}
+
+        {/* 色とエッジ（スマホは「見た目」で畳む） */}
+        <div className="editorHudTools" aria-label="色とエッジ">
+          {isCompactHud && (
+            <div className="hudCompactRow" aria-label="クイック操作">
+              <div className="hudPill" aria-label="ブロック数">
+                ブロック: {cubeCount}
+              </div>
+              <button
+                type="button"
+                className={`miniToggle ${showHelp ? "on" : ""}`}
+                onClick={() => {
+                  setShowHelp((v) => {
+                    const next = !v;
+                    track("hud_toggle_help", { on: next });
+                    return next;
+                  });
+                }}
+                title="操作"
+                aria-label="操作"
+              >
+                操作
+              </button>
+              <button
+                type="button"
+                className={`miniToggle ${showLook ? "on" : ""}`}
+                onClick={() => {
+                  setShowLook((v) => {
+                    const next = !v;
+                    track("hud_toggle_look", { on: next });
+                    return next;
+                  });
+                }}
+                title="見た目"
+                aria-label="見た目"
+              >
+                <span className="colorDot" style={{ background: cubeColor }} />
+                見た目
+              </button>
+            </div>
+          )}
+
+          {(!isCompactHud || showLook) && (
+            <>
+              <div className="swatches" aria-label="色">
+                {BAMBU_FILAMENT_COLORS.map((c) => (
+                  <button
+                    key={c.name}
+                    type="button"
+                    className={`swatch ${cubeColor.toLowerCase() === c.hex.toLowerCase() ? "selected" : ""}`}
+                    title={c.name}
+                    aria-label={c.name}
+                    onClick={() => {
+                      setCubeColor(c.hex);
+                      track("color_change", { name: c.name, hex: c.hex });
+                    }}
+                    style={{ background: c.hex }}
+                  />
+                ))}
+              </div>
+              <button
+                type="button"
+                className={`miniToggle ${showEdges ? "on" : ""}`}
+                onClick={() =>
+                  setShowEdges((v) => {
+                    const next = !v;
+                    track("edges_toggle", { on: next });
+                    return next;
+                  })
+                }
+                title="エッジ"
+                aria-label="エッジ"
+              >
+                エッジ
+              </button>
+            </>
+          )}
         </div>
         <div className="editorHudActions">
           {!previewOpen && (

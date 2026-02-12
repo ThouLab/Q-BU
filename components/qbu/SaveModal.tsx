@@ -2,6 +2,8 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 
+import { formatMm, resolvePrintScale, type PrintScaleSetting } from "./printScale";
+
 type Method = "project" | "stl";
 
 function sanitizeBaseName(input: string): string {
@@ -27,8 +29,8 @@ type Props = {
   defaultTargetMm: number;
 
   onSaveProject: (baseName: string) => void;
-  onExportStl: (baseName: string, targetMm: number) => void;
-  onOpenPrintPrep: (baseName: string, targetMm: number) => void;
+  onExportStl: (baseName: string, setting: PrintScaleSetting) => void;
+  onOpenPrintPrep: (baseName: string, setting: PrintScaleSetting) => void;
 };
 
 export default function SaveModal({
@@ -42,29 +44,50 @@ export default function SaveModal({
 }: Props) {
   const [baseName, setBaseName] = useState("Q-BU");
   const [method, setMethod] = useState<Method>("project");
+  const [scaleMode, setScaleMode] = useState<PrintScaleSetting["mode"]>("maxSide");
   const [targetMmText, setTargetMmText] = useState(String(defaultTargetMm));
+  const [blockEdgeMmText, setBlockEdgeMmText] = useState("1");
 
   useEffect(() => {
     if (!open) return;
     // 開くたびに分かりやすい初期値
     setBaseName("Q-BU");
     setMethod("project");
+    setScaleMode("maxSide");
     setTargetMmText(String(defaultTargetMm));
+    setBlockEdgeMmText("1");
   }, [open, defaultTargetMm]);
 
   const safeName = useMemo(() => sanitizeBaseName(baseName), [baseName]);
 
-  const targetMm = useMemo(() => {
-    const n = Number(targetMmText);
-    if (!Number.isFinite(n)) return defaultTargetMm;
-    return clamp(Math.round(n), 10, 300);
-  }, [targetMmText, defaultTargetMm]);
+  const resolved = useMemo(() => {
+    const dim = Math.max(1e-6, maxDim || 1);
+    const maxSideRaw = Number(targetMmText);
+    const edgeRaw = Number(blockEdgeMmText);
+
+    const setting: PrintScaleSetting =
+      scaleMode === "maxSide"
+        ? { mode: "maxSide", maxSideMm: Number.isFinite(maxSideRaw) ? maxSideRaw : defaultTargetMm }
+        : { mode: "blockEdge", blockEdgeMm: Number.isFinite(edgeRaw) ? edgeRaw : 1 };
+
+    return resolvePrintScale({
+      bboxMaxDimWorld: dim,
+      setting,
+      clampMaxSideMm: { min: 10, max: 300 },
+      clampBlockEdgeMm: { min: 0.1, max: 500 },
+    });
+  }, [maxDim, scaleMode, targetMmText, blockEdgeMmText, defaultTargetMm]);
+
+  const finalSetting: PrintScaleSetting = useMemo(() => {
+    return resolved.mode === "maxSide"
+      ? { mode: "maxSide", maxSideMm: resolved.maxSideMm }
+      : { mode: "blockEdge", blockEdgeMm: resolved.mmPerUnit };
+  }, [resolved]);
 
   const scaleHint = useMemo(() => {
     const dim = Math.max(1, maxDim || 1);
-    const s = targetMm / dim;
-    return { dim, s };
-  }, [maxDim, targetMm]);
+    return { dim, blockEdgeMm: resolved.mmPerUnit };
+  }, [maxDim, resolved.mmPerUnit]);
 
   if (!open) return null;
 
@@ -131,18 +154,56 @@ export default function SaveModal({
           {method === "stl" && (
             <div className="saveSection">
               <div className="saveLabel">サイズ</div>
+
+              <div className="saveRow" style={{ flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className={`chip ${scaleMode === "maxSide" ? "active" : ""}`}
+                  onClick={() => setScaleMode("maxSide")}
+                >
+                  最長辺
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${scaleMode === "blockEdge" ? "active" : ""}`}
+                  onClick={() => setScaleMode("blockEdge")}
+                >
+                  1ブロック
+                </button>
+              </div>
+
               <div className="saveRow">
-                <input
-                  className="saveNumber"
-                  value={targetMmText}
-                  onChange={(e) => setTargetMmText(e.target.value)}
-                  inputMode="numeric"
-                />
-                <div className="saveHint">mm（最長辺を {targetMm}mm に）</div>
+                {scaleMode === "maxSide" ? (
+                  <>
+                    <input
+                      className="saveNumber"
+                      value={targetMmText}
+                      onChange={(e) => setTargetMmText(e.target.value)}
+                      inputMode="numeric"
+                    />
+                    <div className="saveHint">mm（最長辺を {Math.round(resolved.maxSideMm)}mm に）</div>
+                  </>
+                ) : (
+                  <>
+                    <input
+                      className="saveNumber"
+                      value={blockEdgeMmText}
+                      onChange={(e) => setBlockEdgeMmText(e.target.value)}
+                      inputMode="decimal"
+                    />
+                    <div className="saveHint">
+                      mm（1ブロック辺）→ 最大辺 {formatMm(resolved.maxSideMm, 1)}mm
+                    </div>
+                  </>
+                )}
               </div>
               <div className="saveHint">
-                現在のモデル：最大 <b>{Math.round(scaleHint.dim)}</b> ブロック → 出力スケール <b>×{scaleHint.s.toFixed(2)}</b>
+                現在のモデル：最大 <b>{Math.round(scaleHint.dim)}</b> ブロック ／ 1ブロック辺 <b>{formatMm(scaleHint.blockEdgeMm, 2)}mm</b>
               </div>
+
+              {resolved.warnTooLarge && (
+                <div className="warnYellow">⚠ 最大辺が180mmを超えています（印刷依頼には大きすぎます）</div>
+              )}
             </div>
           )}
         </div>
@@ -158,10 +219,10 @@ export default function SaveModal({
             </button>
           ) : (
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
-              <button type="button" className="saveBtn" onClick={() => onExportStl(safeName, targetMm)}>
+              <button type="button" className="saveBtn" onClick={() => onExportStl(safeName, finalSetting)}>
                 STLを書き出す
               </button>
-              <button type="button" className="saveBtn primary" onClick={() => onOpenPrintPrep(safeName, targetMm)}>
+              <button type="button" className="saveBtn primary" onClick={() => onOpenPrintPrep(safeName, finalSetting)}>
                 印刷用にSTLを書き出す
               </button>
             </div>

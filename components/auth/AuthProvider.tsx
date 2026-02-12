@@ -13,7 +13,6 @@ export type AuthState = {
   loading: boolean;
 
   signInWithGoogle: () => Promise<void>;
-  signInWithEmail: (email: string) => Promise<{ ok: boolean; message?: string }>; // マジックリンク
   signOut: () => Promise<void>;
 };
 
@@ -26,6 +25,23 @@ function buildCallbackUrl(nextPathname: string) {
   const origin = window.location.origin;
   const next = encodeURIComponent(nextPathname || "/");
   return `${origin}/auth/callback?next=${next}`;
+}
+
+function isProbablyEmbeddedWebView(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  // Android WebView includes `wv` or `Version/4.0`
+  const isAndroidWebView = /\bwv\b/.test(ua) || /Version\/4\.0/i.test(ua);
+  // iOS WebView: iOS device but not Safari/Chrome/Firefox/Edge
+  const isiOS = /iPhone|iPad|iPod/i.test(ua);
+  const isSafari = /Safari/i.test(ua);
+  const isCriOS = /CriOS/i.test(ua);
+  const isFxiOS = /FxiOS/i.test(ua);
+  const isEdgiOS = /EdgiOS/i.test(ua);
+  const isiOSWebView = isiOS && !isSafari && !isCriOS && !isFxiOS && !isEdgiOS;
+  // Some in-app browsers are effectively embedded webviews.
+  const isInApp = /FBAN|FBAV|Instagram|Line|Twitter|Snapchat|WhatsApp/i.test(ua);
+  return isAndroidWebView || isiOSWebView || isInApp;
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -91,35 +107,50 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     const redirectTo = buildCallbackUrl(window.location.pathname || "/");
+    const embedded = isProbablyEmbeddedWebView();
+
+    // Embedded webviews may be blocked by Google's OAuth policy (disallowed_useragent).
+    // In those cases, opening in a new tab / external browser tends to work better.
+    let popup: Window | null = null;
+    if (embedded) {
+      try {
+        // Open immediately to avoid popup blockers.
+        popup = window.open("about:blank", "_blank", "noopener,noreferrer");
+      } catch {
+        popup = null;
+      }
+    }
+
     const { data, error } = await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo },
+      options: { redirectTo, skipBrowserRedirect: true },
     });
 
     if (error) {
+      try {
+        popup?.close();
+      } catch {
+        // ignore
+      }
       alert("Googleログインに失敗しました。設定を確認してください。");
       return;
     }
 
-    // 通常は自動リダイレクトされますが、念のため
-    if (data?.url) window.location.assign(data.url);
-  };
+    const url = data?.url;
+    if (!url) return;
 
-  const signInWithEmail = async (email: string) => {
-    if (!supabase) {
-      return { ok: false, message: "ログイン機能が未設定です。" };
+    if (popup) {
+      try {
+        popup.location.href = url;
+        popup.focus?.();
+        return;
+      } catch {
+        // ignore
+      }
     }
-    const cleaned = email.trim();
-    if (!cleaned) return { ok: false, message: "メールアドレスを入力してください。" };
 
-    const emailRedirectTo = buildCallbackUrl(window.location.pathname || "/");
-    const { error } = await supabase.auth.signInWithOtp({
-      email: cleaned,
-      options: { emailRedirectTo },
-    });
-
-    if (error) return { ok: false, message: error.message };
-    return { ok: true, message: "メールを確認してください。" };
+    // Same-tab fallback
+    window.location.assign(url);
   };
 
   const signOut = async () => {
@@ -133,7 +164,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     session,
     loading,
     signInWithGoogle,
-    signInWithEmail,
     signOut,
   };
 
