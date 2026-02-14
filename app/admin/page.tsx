@@ -42,9 +42,9 @@ export default async function AdminDashboard({
   searchParams,
 }: {
   // Next.js 15+: searchParams is async (Promise). Await before accessing.
-  searchParams?: Promise<{ range?: string }> | { range?: string };
+  searchParams?: Promise<{ range?: string }>;
 }) {
-  const sp = (searchParams ? await searchParams : undefined) as { range?: string } | undefined;
+  const sp = searchParams ? await searchParams : undefined;
   const days = clampRangeDays(sp?.range);
 
   const sb = await getSupabaseServerClient();
