@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 
 import ConsentModal from "@/components/account/ConsentModal";
 import { useAuth } from "@/components/auth/AuthProvider";
+import { APP_VERSION, detectDeviceType } from "@/lib/appMeta";
 
 export type TelemetryEvent = {
   name: string;
@@ -26,6 +27,12 @@ export type TelemetryAPI = {
   sessionId: string;
 
   track: (name: string, payload?: any) => void;
+
+  /**
+   * 重要イベント用：できるだけ早く送信する（内部で即flush）
+   * - STL書き出し / 注文確定 など、「取りこぼしたくない」イベントに使用
+   */
+  trackNow: (name: string, payload?: any) => void;
 
   /** 必須同意のUIを開く（通常は自動で出る） */
   openConsent: () => void;
@@ -315,7 +322,13 @@ export function TelemetryProvider({ children }: { children: React.ReactNode }) {
     }, 1200);
   };
 
-  const track = (name: string, payload?: any) => {
+  const attachCommonMeta = (p: any) => {
+    if (!p || typeof p !== "object") return;
+    if (p.app_version == null) p.app_version = APP_VERSION;
+    if (p.device_type == null) p.device_type = detectDeviceType();
+  };
+
+  const pushEvent = (name: string, payload?: any) => {
     if (!enabledRef.current) return;
     const anon = anonIdRef.current;
     if (!anon) return;
@@ -324,6 +337,9 @@ export function TelemetryProvider({ children }: { children: React.ReactNode }) {
     countersRef.current[name] = (countersRef.current[name] ?? 0) + 1;
     seqRef.current += 1;
 
+    const p = payload ? { ...payload, seq: seqRef.current } : { seq: seqRef.current };
+    attachCommonMeta(p);
+
     const ev: TelemetryEvent = {
       name,
       ts: Date.now(),
@@ -331,15 +347,24 @@ export function TelemetryProvider({ children }: { children: React.ReactNode }) {
       anon_id: anon,
       session_id: sessionId,
       user_id: user?.id ?? null,
-      payload: payload ? { ...payload, seq: seqRef.current } : { seq: seqRef.current },
+      payload: p,
     };
     queueRef.current.push(ev);
+  };
 
+  const track = (name: string, payload?: any) => {
+    pushEvent(name, payload);
     if (queueRef.current.length >= 32) {
       void flush("limit");
       return;
     }
     scheduleFlush();
+  };
+
+  const trackNow = (name: string, payload?: any) => {
+    pushEvent(name, payload);
+    // できるだけ早く送る（失敗してもUIを止めない）
+    void flush("limit");
   };
 
   const grantConsent = () => {
@@ -526,6 +551,7 @@ export function TelemetryProvider({ children }: { children: React.ReactNode }) {
     anonId: anonIdRef.current || "",
     sessionId,
     track,
+    trackNow,
     openConsent,
     grantConsent,
   };

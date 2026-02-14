@@ -1,0 +1,169 @@
+.adminRoot {
+  min-height: 100vh;
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+.adminHeader {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: rgba(248, 250, 252, 0.9);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  padding: 12px 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.adminBrand {
+  font-weight: 900;
+  letter-spacing: 0.02em;
+}
+
+.adminBrand a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.adminHeaderRight {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.adminChip {
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  background: rgba(255, 255, 255, 0.7);
+  font-weight: 800;
+}
+
+.adminBody {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 12px;
+  padding: 12px;
+}
+
+.adminNav {
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 14px;
+  padding: 10px;
+  display: grid;
+  gap: 4px;
+  align-content: start;
+  height: fit-content;
+}
+
+.adminNav a {
+  text-decoration: none;
+  color: inherit;
+  padding: 10px 10px;
+  border-radius: 12px;
+  font-weight: 800;
+  font-size: 14px;
+}
+
+.adminNav a:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.adminMain {
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.adminH1 {
+  margin: 0 0 10px 0;
+  font-size: 18px;
+}
+
+.adminMuted {
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.adminCards {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.adminCard {
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.8);
+}
+
+.adminCardLabel {
+  font-size: 12px;
+  color: #6b7280;
+  font-weight: 800;
+}
+
+.adminCardValue {
+  font-size: 20px;
+  font-weight: 900;
+  margin-top: 6px;
+}
+
+.adminTable {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+}
+
+.adminTable th,
+.adminTable td {
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  padding: 8px 6px;
+  font-size: 12px;
+  text-align: left;
+}
+
+.adminTable th {
+  color: #6b7280;
+  font-weight: 900;
+}
+
+.adminWarn {
+  padding: 10px 12px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 12px;
+  background: rgba(255, 237, 213, 0.7);
+  margin: 10px 0;
+  font-weight: 700;
+}
+
+.adminKbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: rgba(255, 255, 255, 0.8);
+}
+
+@media (max-width: 900px) {
+  .adminBody {
+    grid-template-columns: 1fr;
+  }
+  .adminNav {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .adminCards {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

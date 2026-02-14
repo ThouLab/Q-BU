@@ -17,6 +17,7 @@ import { DEFAULT_CUBE_COLOR } from "@/components/qbu/filamentColors";
 import { readFileAsDataURL, splitThreeViewSheet, type RefImages } from "@/components/qbu/referenceUtils";
 import { countComponents } from "@/components/qbu/printPrepUtils";
 import { resolvePrintScale, type PrintScaleSetting } from "@/components/qbu/printScale";
+import { decodeQbu, encodeQbu } from "@/components/qbu/qbuFile";
 
 const STORAGE_KEY = "qbu_project_v1";
 const DRAFT_KEY = "qbu_draft_v2";
@@ -53,26 +54,85 @@ type ProjectDataV3 = {
   edges?: boolean;
 };
 
-type ProjectData = ProjectDataV1 | ProjectDataV2 | ProjectDataV3;
+// v1.0.15+: print-order / print-draft JSON can be saved/downloaded as well.
+// This format is also used for admin-side model_data snapshots.
+type ProjectDataV4 = {
+  version: 4;
+  kind?: string;
+  blocks: string[];
+  supportBlocks?: string[];
+  scaleSetting?: PrintScaleSetting;
+  // optional UI state
+  color?: string;
+  edges?: boolean;
+  // convenience fields (order snapshots)
+  mmPerUnit?: number;
+  maxSideMm?: number;
+  mode?: string;
+};
+
+type ProjectData = ProjectDataV1 | ProjectDataV2 | ProjectDataV3 | ProjectDataV4;
+
+function parseScaleSettingFromAny(obj: any): PrintScaleSetting | undefined {
+  if (!obj || typeof obj !== "object") return undefined;
+  const mode = (obj as any).mode;
+  if (mode === "maxSide") {
+    const mm = Number((obj as any).maxSideMm);
+    if (Number.isFinite(mm) && mm > 0) return { mode: "maxSide", maxSideMm: mm };
+  }
+  if (mode === "blockEdge") {
+    const mm = Number((obj as any).blockEdgeMm);
+    if (Number.isFinite(mm) && mm > 0) return { mode: "blockEdge", blockEdgeMm: mm };
+  }
+  return undefined;
+}
 
 function parseProjectJSON(text: string): ProjectData | null {
   try {
     const obj = JSON.parse(text);
     if (!obj || typeof obj !== "object") return null;
-    if (obj.version !== 1 && obj.version !== 2 && obj.version !== 3) return null;
-    if (!Array.isArray(obj.blocks)) return null;
 
-    const blocks = obj.blocks.filter((v: any) => typeof v === "string");
+    // v1-v4 (project file)
+    if ((obj as any).version === 1 || (obj as any).version === 2 || (obj as any).version === 3 || (obj as any).version === 4) {
+      if (!Array.isArray((obj as any).blocks)) return null;
+      const blocks = (obj as any).blocks.filter((v: any) => typeof v === "string");
 
-    if (obj.version === 1) return { version: 1, blocks };
+      if ((obj as any).version === 1) return { version: 1, blocks };
 
-    const color = typeof (obj as any).color === "string" ? (obj as any).color : undefined;
-    const edges = typeof (obj as any).edges === "boolean" ? (obj as any).edges : undefined;
+      const color = typeof (obj as any).color === "string" ? (obj as any).color : undefined;
+      const edges = typeof (obj as any).edges === "boolean" ? (obj as any).edges : undefined;
 
-    if (obj.version === 2) return { version: 2, blocks, color, edges };
+      if ((obj as any).version === 2) return { version: 2, blocks, color, edges };
+      if ((obj as any).version === 3) return { version: 3, blocks, color, edges };
 
-    // v3
-    return { version: 3, blocks, color, edges };
+      // v4: may include print supports and scale setting
+      const supportBlocks = Array.isArray((obj as any).supportBlocks)
+        ? (obj as any).supportBlocks.filter((v: any) => typeof v === "string")
+        : undefined;
+      const scaleSetting = parseScaleSettingFromAny((obj as any).scaleSetting);
+      const kind = typeof (obj as any).kind === "string" ? (obj as any).kind : undefined;
+      const mmPerUnit = Number.isFinite(Number((obj as any).mmPerUnit)) ? Number((obj as any).mmPerUnit) : undefined;
+      const maxSideMm = Number.isFinite(Number((obj as any).maxSideMm)) ? Number((obj as any).maxSideMm) : undefined;
+      const mode = typeof (obj as any).mode === "string" ? (obj as any).mode : undefined;
+      return { version: 4, kind, blocks, supportBlocks, scaleSetting, color, edges, mmPerUnit, maxSideMm, mode };
+    }
+
+    // v1.0.15-δ2: unversioned print-order snapshot JSON (admin download)
+    if (Array.isArray((obj as any).blocks)) {
+      const blocks = (obj as any).blocks.filter((v: any) => typeof v === "string");
+      const supportBlocks = Array.isArray((obj as any).supportBlocks)
+        ? (obj as any).supportBlocks.filter((v: any) => typeof v === "string")
+        : undefined;
+      const scaleSetting = parseScaleSettingFromAny((obj as any).scaleSetting) ||
+        parseScaleSettingFromAny({ mode: (obj as any).mode, maxSideMm: (obj as any).maxSideMm, blockEdgeMm: (obj as any).blockEdgeMm });
+      const kind = typeof (obj as any).kind === "string" ? (obj as any).kind : "print_order";
+      const mmPerUnit = Number.isFinite(Number((obj as any).mmPerUnit)) ? Number((obj as any).mmPerUnit) : undefined;
+      const maxSideMm = Number.isFinite(Number((obj as any).maxSideMm)) ? Number((obj as any).maxSideMm) : undefined;
+      const mode = typeof (obj as any).mode === "string" ? (obj as any).mode : undefined;
+      return { version: 4, kind, blocks, supportBlocks, scaleSetting, mmPerUnit, maxSideMm, mode };
+    }
+
+    return null;
   } catch {
     return null;
   }
@@ -82,8 +142,36 @@ function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
 }
 
+function uuid(): string {
+  try {
+    const c: any = (globalThis as any).crypto;
+    if (c?.randomUUID) return c.randomUUID();
+  } catch {
+    // ignore
+  }
+  return "id-" + Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+}
+
+// 軽量・同期の安定ハッシュ（暗号学的強度は不要：分析用途）
+function fnv1a64Hex(input: string): string {
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = (hash * prime) & 0xffffffffffffffffn;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+function computeModelFingerprint(baseKeys: Set<string>, supportKeys: Set<SubKey>): string {
+  const base = Array.from(baseKeys).sort();
+  const sup = Array.from(supportKeys).sort();
+  const raw = `b:${base.join(",")}|s:${sup.join(",")}`;
+  return `m1_${fnv1a64Hex(raw)}`;
+}
+
 export default function Builder() {
-  const { track } = useTelemetry();
+  const { track, trackNow } = useTelemetry();
   const { user } = useAuth();
 
   const requireLogin = (message: string) => {
@@ -115,6 +203,12 @@ export default function Builder() {
   // 編集カメラ（最初は右上から）
   const [yawIndex, setYawIndex] = useState(1); // 45°
   const [pitchIndex, setPitchIndex] = useState(1); // +45°
+
+  // 分析用：エディタ表示
+  useEffect(() => {
+    track("builder_open", { logged_in: Boolean(user) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 初回：保存済みがあれば復元（ドラフト優先）
   useEffect(() => {
@@ -204,11 +298,13 @@ export default function Builder() {
     track("save_modal_open");
   };
 
-  const downloadProject = (baseName: string) => {
+  const downloadProject = async (baseName: string, opts?: { format?: "json" | "qbu"; password?: string }) => {
     if (!user) {
       requireLogin("保存するにはログインが必要です。");
       return;
     }
+
+    const format = opts?.format || "json";
 
     track("project_save", {
       blocks: blocks.size,
@@ -217,36 +313,56 @@ export default function Builder() {
       edges: showEdges,
     });
 
-    const data: ProjectDataV2 = {
+    const base = Array.from(blocks);
+
+    // Local restore always keeps a JSON snapshot (regardless of download format)
+    const restoreData: ProjectDataV2 = {
       version: 2,
-      blocks: Array.from(blocks),
+      blocks: base,
       color: cubeColor,
       edges: showEdges,
     };
 
     // 同じ端末では「保存」で復元できる
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(restoreData));
     } catch {
       // ignore
     }
 
     // ドラフトも最新化
     try {
-      localStorage.setItem(DRAFT_KEY, JSON.stringify({ ...data, updated_at: Date.now() }));
+      localStorage.setItem(DRAFT_KEY, JSON.stringify({ ...restoreData, updated_at: Date.now() }));
     } catch {
       // ignore
     }
 
+    if (format === "qbu") {
+      const payload: ProjectDataV4 = {
+        version: 4,
+        kind: "project",
+        blocks: base,
+        color: cubeColor,
+        edges: showEdges,
+      };
+      const bytes = await encodeQbu(payload, { password: opts?.password, compress: true });
+      track("project_save_download", { kind: "qbu" });
+      // TSのlib.dom型の都合で BlobPart にキャスト
+      downloadBlob(new Blob([bytes as any], { type: "application/octet-stream" }), `${baseName}.qbu`);
+      return;
+    }
+
+    // Default: JSON (legacy)
     track("project_save_download", { kind: "json" });
-    downloadBlob(new Blob([JSON.stringify(data)], { type: "application/json" }), `${baseName}_project.json`);
+    downloadBlob(new Blob([JSON.stringify(restoreData)], { type: "application/json" }), `${baseName}_project.json`);
   };
 
   const exportStlFromBlocks = (
     baseName: string,
     scaleSetting: PrintScaleSetting,
     baseKeys: Set<string>,
-    supportKeys: Set<SubKey>
+    supportKeys: Set<SubKey>,
+    exportKind: "direct" | "print_prep" = "direct"
   ) => {
     if (!user) {
       requireLogin("保存するにはログインが必要です。");
@@ -271,13 +387,22 @@ export default function Builder() {
     const s = resolved.mmPerUnit;
     outRoot.scale.set(s, s, s);
 
-    track("project_export_stl", {
-      blocks: baseKeys.size,
-      supports: supportKeys.size,
-      max_dim: bboxNow.maxDim,
+    const export_id = uuid();
+    const model_fingerprint = computeModelFingerprint(baseKeys, supportKeys);
+
+    // 重要イベント：取りこぼし防止のため即flush
+    trackNow("stl_export", {
+      export_id,
+      export_kind: exportKind,
+      model_fingerprint,
+      block_count: baseKeys.size,
+      support_block_count: supportKeys.size,
+      bbox_max_dim_world: bboxNow.maxDim,
       scale_mode: resolved.mode,
       max_side_mm: resolved.maxSideMm,
       mm_per_unit: resolved.mmPerUnit,
+      warn_too_large: Boolean(resolved.warnTooLarge),
+      name: baseName,
     });
 
     const outCubes = new THREE.Group();
@@ -332,7 +457,7 @@ export default function Builder() {
       if (!ok) return;
     }
 
-    exportStlFromBlocks(baseName, scaleSetting, blocks, new Set());
+    exportStlFromBlocks(baseName, scaleSetting, blocks, new Set(), "direct");
   };
 
   const handleImportThreeView = async (file: File) => {
@@ -388,7 +513,65 @@ export default function Builder() {
       return;
     }
 
-    // JSON → プロジェクト読み込み
+    // QBU packaged file (.qbu)
+    if (file.name.toLowerCase().endsWith(".qbu")) {
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        // First try without prompting (works for non-password files / default passphrase).
+        let dec = await decodeQbu(bytes, { password: "" });
+        if (!dec.ok) {
+          let password = "";
+          try {
+            password = window.prompt("QBUファイルのパスワード（未設定なら空欄）") || "";
+          } catch {
+            // ignore
+          }
+          dec = await decodeQbu(bytes, { password });
+        }
+        if (!dec.ok) {
+          window.alert(`QBUの読み込みに失敗しました: ${dec.error}`);
+          return;
+        }
+
+        const data = parseProjectJSON(JSON.stringify(dec.payload));
+        if (!data) {
+          window.alert("QBUの中身を解析できませんでした。（形式が未対応）");
+          return;
+        }
+
+        track("project_load", {
+          ext: "qbu",
+          size: file.size,
+          version: data.version,
+          blocks: data.blocks.length,
+          qbu_encrypted: dec.encrypted,
+          qbu_compressed: dec.compressed,
+        });
+
+        const next = new Set<string>();
+        for (const k of data.blocks) next.add(k);
+        if (next.size === 0) next.add(keyOf({ x: 0, y: 0, z: 0 }));
+        setBlocks(next);
+
+        // v2+：色・エッジ
+        if (data.version >= 2) {
+          if (typeof (data as any).color === "string") setCubeColor((data as any).color);
+          if (typeof (data as any).edges === "boolean") setShowEdges((data as any).edges);
+        }
+
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+          localStorage.setItem(DRAFT_KEY, JSON.stringify({ ...(data as any), updated_at: Date.now() }));
+        } catch {
+          // ignore
+        }
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    // JSON → プロジェクト/印刷データ読み込み
     if (file.name.toLowerCase().endsWith(".json")) {
       try {
         const text = await file.text();
@@ -403,8 +586,8 @@ export default function Builder() {
         if (next.size === 0) next.add(keyOf({ x: 0, y: 0, z: 0 }));
         setBlocks(next);
 
-        // v2/v3：色・エッジ
-        if (data.version === 2 || data.version === 3) {
+        // v2+：色・エッジ
+        if (data.version >= 2) {
           if (typeof (data as any).color === "string") setCubeColor((data as any).color);
           if (typeof (data as any).edges === "boolean") setShowEdges((data as any).edges);
         }
@@ -443,11 +626,23 @@ export default function Builder() {
         ? { mode: "maxSide", maxSideMm: resolved.maxSideMm }
         : { mode: "blockEdge", blockEdgeMm: resolved.mmPerUnit };
 
+    const modelFingerprint = computeModelFingerprint(baseKeys, supportKeys);
+
+    track("print_request_start", {
+      model_fingerprint: modelFingerprint,
+      block_count: baseKeys.size,
+      support_block_count: supportKeys.size,
+      max_side_mm: resolved.maxSideMm,
+      mm_per_unit: resolved.mmPerUnit,
+      scale_mode: resolved.mode,
+    });
+
     try {
       sessionStorage.setItem(
         PRINT_DRAFT_KEY,
         JSON.stringify({
           baseName,
+          modelFingerprint,
           // legacy (print/page.tsx v1 expects targetMm)
           targetMm: resolved.maxSideMm,
           // v1.0.14+ (scale toggle)
@@ -541,8 +736,8 @@ export default function Builder() {
         }}
         maxDim={bbox.maxDim}
         defaultTargetMm={DEFAULT_TARGET_MM}
-        onSaveProject={(name) => {
-          downloadProject(name);
+        onSaveProject={(name, opts) => {
+          void downloadProject(name, opts);
           setSaveOpen(false);
         }}
         onExportStl={(name, setting) => {
@@ -554,6 +749,10 @@ export default function Builder() {
             requireLogin("保存するにはログインが必要です。");
             return;
           }
+          track("print_prep_open", {
+            blocks: blocks.size,
+            max_dim: bbox.maxDim,
+          });
           setPrepName(name);
           setPrepScaleSetting(setting);
           setPrepOpen(true);
@@ -568,7 +767,7 @@ export default function Builder() {
         baseBlocks={blocks}
         onClose={() => setPrepOpen(false)}
         onExport={(name, setting, baseKeys, supportKeys) => {
-          exportStlFromBlocks(name, setting, baseKeys, supportKeys);
+          exportStlFromBlocks(name, setting, baseKeys, supportKeys, "print_prep");
           setPrepOpen(false);
         }}
         onRequestPrint={(name, setting, baseKeys, supportKeys) => {

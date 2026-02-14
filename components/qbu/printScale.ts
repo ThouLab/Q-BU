@@ -101,10 +101,22 @@ export type PrintPriceEstimate = {
   breakdown: {
     baseFeeYen: number;
     volumeFeeYen: number;
+    /** pricing params snapshot (optional) */
+    perCm3Yen?: number;
+    minFeeYen?: number;
+    rawYen?: number;
+    roundingStepYen?: number;
   };
   volumeCm3: number;
   // for UI copy
   notes: string[];
+};
+
+export type PricingParams = {
+  baseFeeYen: number;
+  perCm3Yen: number;
+  minFeeYen: number;
+  roundingStepYen?: number;
 };
 
 /**
@@ -116,25 +128,33 @@ export type PrintPriceEstimate = {
  *
  * Tune these numbers later to match your business assumptions.
  */
-export function estimatePrintPriceYen(volumeCm3: number): PrintPriceEstimate {
+export function estimatePrintPriceYen(volumeCm3: number, pricing?: Partial<PricingParams>): PrintPriceEstimate {
   const v = Math.max(0, Number.isFinite(volumeCm3) ? volumeCm3 : 0);
 
-  // --- tunables (ballpark) ---
-  const BASE_FEE = 800; // JPY
-  const PER_CM3 = 60; // JPY per cm^3 (solid volume estimate)
-  const MIN = 1200; // JPY minimum
-  // ---------------------------
+  // --- defaults (ballpark) ---
+  const BASE_FEE = Number.isFinite(pricing?.baseFeeYen) ? Number(pricing?.baseFeeYen) : 800;
+  const PER_CM3 = Number.isFinite(pricing?.perCm3Yen) ? Number(pricing?.perCm3Yen) : 60;
+  const MIN = Number.isFinite(pricing?.minFeeYen) ? Number(pricing?.minFeeYen) : 1200;
+  const STEP = Number.isFinite(pricing?.roundingStepYen) ? Math.max(1, Math.round(Number(pricing?.roundingStepYen))) : 10;
+  // --------------------------
 
   const volumeFee = Math.round(v * PER_CM3);
   const raw = BASE_FEE + volumeFee;
   const subtotal = Math.max(MIN, raw);
 
-  // round to nearest 10 yen for nicer UX
-  const rounded = Math.round(subtotal / 10) * 10;
+  // round for nicer UX
+  const rounded = Math.round(subtotal / STEP) * STEP;
 
   return {
     subtotalYen: rounded,
-    breakdown: { baseFeeYen: BASE_FEE, volumeFeeYen: volumeFee },
+    breakdown: {
+      baseFeeYen: BASE_FEE,
+      volumeFeeYen: volumeFee,
+      perCm3Yen: PER_CM3,
+      minFeeYen: MIN,
+      rawYen: raw,
+      roundingStepYen: STEP,
+    },
     volumeCm3: v,
     notes: [
       "概算です（造形方式・材料・肉厚・充填率で変動します）。",

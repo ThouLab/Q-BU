@@ -11,6 +11,7 @@ import {
   formatMm,
   formatYen,
   resolvePrintScale,
+  type PricingParams,
   type PrintScaleSetting,
 } from "./printScale";
 
@@ -35,6 +36,9 @@ export default function PrintPrepModal({
   onRequestPrint,
 }: PrintPrepModalProps) {
   const [supportBlocks, setSupportBlocks] = useState<Set<SubKey>>(new Set());
+
+  // Active pricing (v1.0.15-γ)
+  const [pricing, setPricing] = useState<Partial<PricingParams> | null>(null);
 
   // Local editable scale setting (UI)
   const [scaleMode, setScaleMode] = useState<PrintScaleSetting["mode"]>(scaleSetting.mode);
@@ -64,6 +68,33 @@ export default function PrintPrepModal({
       setMaxSideMmText("50");
     }
   }, [open, baseBlocks, scaleSetting]);
+
+  // Load active pricing (public API; falls back to defaults if not configured)
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch("/api/pricing/active", { method: "GET" });
+        const data = await res.json().catch(() => null);
+        if (!alive) return;
+        if (!res.ok) return;
+        if (data?.ok && data?.pricing) {
+          setPricing({
+            baseFeeYen: Number(data.pricing.baseFeeYen),
+            perCm3Yen: Number(data.pricing.perCm3Yen),
+            minFeeYen: Number(data.pricing.minFeeYen),
+            roundingStepYen: Number(data.pricing.roundingStepYen),
+          });
+        }
+      } catch {
+        // ignore
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [open]);
 
   const analysis = useMemo(() => {
     return analyzePrintPrepSupport(baseBlocks, supportBlocks);
@@ -101,8 +132,8 @@ export default function PrintPrepModal({
       supportBlockCount: supportBlocks.size,
       mmPerUnit: resolvedScale.mmPerUnit,
     });
-    return estimatePrintPriceYen(volume);
-  }, [baseBlocks.size, supportBlocks.size, resolvedScale.mmPerUnit]);
+    return estimatePrintPriceYen(volume, pricing || undefined);
+  }, [baseBlocks.size, supportBlocks.size, resolvedScale.mmPerUnit, pricing]);
 
   function addSupport(sk: SubKey) {
     if (baseSubCells.has(sk)) return; // base volume is not editable

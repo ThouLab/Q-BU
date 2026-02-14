@@ -6,6 +6,8 @@ import { formatMm, resolvePrintScale, type PrintScaleSetting } from "./printScal
 
 type Method = "project" | "stl";
 
+type ProjectFormat = "json" | "qbu";
+
 function sanitizeBaseName(input: string): string {
   const raw = (input || "").trim();
   // ファイル名として危険/面倒な文字を落とす（OS差分回避）
@@ -28,7 +30,7 @@ type Props = {
   maxDim: number;
   defaultTargetMm: number;
 
-  onSaveProject: (baseName: string) => void;
+  onSaveProject: (baseName: string, opts?: { format?: ProjectFormat; password?: string }) => void;
   onExportStl: (baseName: string, setting: PrintScaleSetting) => void;
   onOpenPrintPrep: (baseName: string, setting: PrintScaleSetting) => void;
 };
@@ -44,6 +46,8 @@ export default function SaveModal({
 }: Props) {
   const [baseName, setBaseName] = useState("Q-BU");
   const [method, setMethod] = useState<Method>("project");
+  const [projectFormat, setProjectFormat] = useState<ProjectFormat>("json");
+  const [qbuPassword, setQbuPassword] = useState("");
   const [scaleMode, setScaleMode] = useState<PrintScaleSetting["mode"]>("maxSide");
   const [targetMmText, setTargetMmText] = useState(String(defaultTargetMm));
   const [blockEdgeMmText, setBlockEdgeMmText] = useState("1");
@@ -53,6 +57,8 @@ export default function SaveModal({
     // 開くたびに分かりやすい初期値
     setBaseName("Q-BU");
     setMethod("project");
+    setProjectFormat("json");
+    setQbuPassword("");
     setScaleMode("maxSide");
     setTargetMmText(String(defaultTargetMm));
     setBlockEdgeMmText("1");
@@ -151,6 +157,51 @@ export default function SaveModal({
             </div>
           </div>
 
+          {method === "project" && (
+            <div className="saveSection">
+              <div className="saveLabel">形式</div>
+
+              <div className="saveRow" style={{ flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className={`chip ${projectFormat === "json" ? "active" : ""}`}
+                  onClick={() => setProjectFormat("json")}
+                >
+                  JSON（互換）
+                </button>
+                <button
+                  type="button"
+                  className={`chip ${projectFormat === "qbu" ? "active" : ""}`}
+                  onClick={() => setProjectFormat("qbu")}
+                >
+                  QBU（圧縮/暗号）
+                </button>
+              </div>
+
+              {projectFormat === "qbu" ? (
+                <>
+                  <div className="saveHint">
+                    .qbu は圧縮＋暗号化された保存形式です（他アプリでの読み込みを抑制できます）。
+                  </div>
+                  <div className="saveRow" style={{ flexWrap: "wrap" }}>
+                    <input
+                      className="saveInput"
+                      value={qbuPassword}
+                      onChange={(e) => setQbuPassword(e.target.value)}
+                      placeholder="パスワード（任意）"
+                      autoComplete="off"
+                    />
+                  </div>
+                  <div className="saveHint">
+                    ※未入力でも保存できます（軽い難読化）。秘密性が必要ならパスワードを設定してください。
+                  </div>
+                </>
+              ) : (
+                <div className="saveHint">.json で保存します（従来互換）。</div>
+              )}
+            </div>
+          )}
+
           {method === "stl" && (
             <div className="saveSection">
               <div className="saveLabel">サイズ</div>
@@ -214,7 +265,11 @@ export default function SaveModal({
           </button>
 
           {method === "project" ? (
-            <button type="button" className="saveBtn primary" onClick={() => onSaveProject(safeName)}>
+            <button
+              type="button"
+              className="saveBtn primary"
+              onClick={() => onSaveProject(safeName, { format: projectFormat, password: qbuPassword })}
+            >
               保存
             </button>
           ) : (

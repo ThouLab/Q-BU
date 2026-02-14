@@ -18,13 +18,23 @@ export type AuthState = {
 
 const AuthContext = createContext<AuthState | null>(null);
 
-function buildCallbackUrl(nextPathname: string) {
-  // Supabase の Redirect URLs に追加するURL
+function buildCallbackUrl() {
+  // Supabase の Redirect URLs に追加するURL（クエリなしで固定）
   // - http://localhost:3000/auth/callback
   // - https://q-bu.com/auth/callback
   const origin = window.location.origin;
-  const next = encodeURIComponent(nextPathname || "/");
-  return `${origin}/auth/callback?next=${next}`;
+  return `${origin}/auth/callback`;
+}
+
+function setNextCookie(nextPathname: string) {
+  // redirectTo にクエリを付けると Supabase 側の許可判定で弾かれ、Site URL にフォールバックしてしまうことがあります。
+  // そのため戻り先は cookie で渡します。
+  try {
+    const v = encodeURIComponent(nextPathname || "/");
+    document.cookie = `qb_next=${v}; Path=/; Max-Age=300; SameSite=Lax`;
+  } catch {
+    // ignore
+  }
 }
 
 function isProbablyEmbeddedWebView(): boolean {
@@ -106,7 +116,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    const redirectTo = buildCallbackUrl(window.location.pathname || "/");
+    const nextPath = `${window.location.pathname}${window.location.search || ""}` || "/";
+    setNextCookie(nextPath);
+
+    const redirectTo = buildCallbackUrl();
     const embedded = isProbablyEmbeddedWebView();
 
     // Embedded webviews may be blocked by Google's OAuth policy (disallowed_useragent).
