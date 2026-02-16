@@ -34,7 +34,7 @@ export async function GET() {
 
   const res = await admin
     .from("admin_roles")
-    .select("user_id,role,is_active,created_at,updated_at")
+    .select("user_id,role,is_active,notify_print_request,created_at,updated_at")
     .order("updated_at", { ascending: false });
 
   if (res.error) {
@@ -63,13 +63,18 @@ export async function POST(request: Request) {
   const user_id = typeof body?.user_id === "string" ? body.user_id.trim() : "";
   const role = safeRole(body?.role);
   const is_active = body?.is_active === false ? false : true;
+  const notify_print_request = Boolean(body?.notify_print_request);
 
   if (!user_id || !isUuid(user_id)) {
     return NextResponse.json({ ok: false, error: "bad_request", message: "user_id が不正です" }, { status: 400 });
   }
 
   // Prevent removing the last active owner.
-  const beforeRes = await admin.from("admin_roles").select("user_id,role,is_active").eq("user_id", user_id).maybeSingle();
+  const beforeRes = await admin
+    .from("admin_roles")
+    .select("user_id,role,is_active,notify_print_request")
+    .eq("user_id", user_id)
+    .maybeSingle();
   const before = beforeRes.data ?? null;
 
   const willBeActiveOwner = is_active && role === "owner";
@@ -94,8 +99,8 @@ export async function POST(request: Request) {
 
   const up = await admin
     .from("admin_roles")
-    .upsert({ user_id, role, is_active }, { onConflict: "user_id" })
-    .select("user_id,role,is_active,created_at,updated_at")
+    .upsert({ user_id, role, is_active, notify_print_request }, { onConflict: "user_id" })
+    .select("user_id,role,is_active,notify_print_request,created_at,updated_at")
     .single();
 
   if (up.error || !up.data) {

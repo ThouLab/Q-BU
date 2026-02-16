@@ -12,6 +12,7 @@ type OrderRow = {
   payment_status: string;
   quote_total_yen: number | null;
   quote_subtotal_yen?: number | null;
+  shipping_yen?: number | null;
   discount_yen?: number | null;
   ticket_id?: string | null;
   max_dim_mm: number | string | null;
@@ -56,7 +57,9 @@ export default async function AdminPrinting() {
 
   const { data, error } = await sb
     .from("print_orders")
-    .select("id,created_at,status,payment_status,quote_total_yen,quote_subtotal_yen,discount_yen,ticket_id,max_dim_mm,block_count,support_block_count,model_name,warn_exceeds_max")
+    .select(
+      "id,created_at,status,payment_status,quote_total_yen,quote_subtotal_yen,shipping_yen,discount_yen,ticket_id,max_dim_mm,block_count,support_block_count,model_name,warn_exceeds_max"
+    )
     .order("created_at", { ascending: false })
     .limit(50);
 
@@ -103,6 +106,8 @@ export default async function AdminPrinting() {
               {(data as OrderRow[] | null)?.map((o) => {
                 const discount = Number(o.discount_yen || 0);
                 const subtotal = o.quote_subtotal_yen != null ? Number(o.quote_subtotal_yen) : null;
+                const ship = o.shipping_yen != null ? Number(o.shipping_yen) : null;
+                const before = subtotal != null ? subtotal + (ship || 0) : null;
                 return (
                   <tr key={o.id}>
                     <td style={{ whiteSpace: "nowrap" }}>{fmtTs(o.created_at)}</td>
@@ -121,9 +126,14 @@ export default async function AdminPrinting() {
                       {o.quote_total_yen != null ? (
                         <>
                           <b>{fmtYen(o.quote_total_yen)}円</b>
+                          {subtotal != null && ship != null && (
+                            <div className="adminMuted" style={{ marginTop: 4 }}>
+                              小計 {fmtYen(subtotal)}円 / 送料 {fmtYen(ship)}円
+                            </div>
+                          )}
                           {discount > 0 && (
                             <div className="adminMuted" style={{ marginTop: 4 }}>
-                              割引 -{fmtYen(discount)}円{subtotal != null ? `（元 ${fmtYen(subtotal)}円）` : ""}
+                              割引 -{fmtYen(discount)}円{before != null ? `（元 ${fmtYen(before)}円）` : ""}
                             </div>
                           )}
                         </>

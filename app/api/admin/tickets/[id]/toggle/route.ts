@@ -36,7 +36,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     .from("tickets")
     .update({ is_active })
     .eq("id", id)
-    .select("id,created_at,created_by,type,code_prefix,value,currency,is_active,expires_at,max_total_uses,max_uses_per_user,constraints,note")
+    .select(
+      "id,created_at,created_by,type,apply_scope,shipping_free,code_prefix,value,currency,is_active,expires_at,max_total_uses,max_uses_per_user,constraints,note"
+    )
     .single();
 
   if (up.error || !up.data) {

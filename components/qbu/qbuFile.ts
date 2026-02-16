@@ -22,19 +22,25 @@ export type QbuDecodeResult =
   | { ok: true; payload: any; encrypted: boolean; compressed: boolean }
   | { ok: false; error: string };
 
+export type QbuUnpackResult =
+  | { ok: true; body: Uint8Array; encrypted: boolean; compressed: boolean }
+  | { ok: false; error: string };
+
 const MAGIC = new Uint8Array([0x51, 0x42, 0x55, 0x31]); // "QBU1"
 const FLAG_ENCRYPTED = 1;
 const FLAG_GZIP = 2;
 
-// If the user doesn't provide a password, we still encrypt with this fixed phrase.
-// NOTE: This is "obfuscation" only. For real confidentiality, set a user password.
+// Backward compatibility:
+// v1.0.15 では「パスワード未入力でも固定フレーズで暗号化」していたため、
+// decode 側ではパスワード未入力時にこの固定フレーズも試せるように残しています。
 const DEFAULT_PASSPHRASE = "qbu-default";
 
-function toArrayBuffer(u: Uint8Array): ArrayBuffer {
-  // BufferSource in lib.dom expects ArrayBuffer (not SharedArrayBuffer).
-  // TypedArray.buffer is ArrayBuffer in browsers, but TS types treat it as ArrayBufferLike,
-  // so we slice+cast to satisfy the type system.
-  return u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength) as ArrayBuffer;
+// TS5.5+ typed arrays are generic over ArrayBufferLike. WebCrypto BufferSource expects ArrayBuffer-backed views.
+// Most browser-created Uint8Array are ArrayBuffer-backed, but we defensively ensure the correct type.
+function asArrayBufferView(bytes: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBuffer> {
+  return bytes.buffer instanceof ArrayBuffer
+    ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    : new Uint8Array(bytes); // copy into a new ArrayBuffer
 }
 
 function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
@@ -50,35 +56,86 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+async function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function readAllBytes(stream: ReadableStream<any>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  let lastYield = typeof performance !== "undefined" ? performance.now() : Date.now();
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+    chunks.push(chunk);
+    total += chunk.length;
+
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (now - lastYield > 16) {
+      lastYield = now;
+      await yieldToEventLoop();
+    }
+  }
+
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
+
 async function gzipCompress(input: Uint8Array): Promise<Uint8Array> {
   if (typeof (globalThis as any).CompressionStream === "undefined") return input;
+
   const cs = new (globalThis as any).CompressionStream("gzip");
+  // Read concurrently to avoid backpressure deadlock on large payloads.
+  const readPromise = readAllBytes(cs.readable);
+
   const writer = cs.writable.getWriter();
   await writer.write(input);
   await writer.close();
-  const buf = await new Response(cs.readable).arrayBuffer();
-  return new Uint8Array(buf);
+
+  return await readPromise;
 }
 
 async function gzipDecompress(input: Uint8Array): Promise<Uint8Array> {
   if (typeof (globalThis as any).DecompressionStream === "undefined") {
     throw new Error("このブラウザはgzip展開に対応していません。");
   }
+
   const ds = new (globalThis as any).DecompressionStream("gzip");
+  // Read concurrently (Response(arrayBuffer) は大きいデータで固まりやすいことがある)
+  const readPromise = readAllBytes(ds.readable);
+
   const writer = ds.writable.getWriter();
-  await writer.write(input);
+  // Chunked write to keep the event loop responsive.
+  const CHUNK = 1024 * 1024; // 1MB
+  for (let i = 0; i < input.length; i += CHUNK) {
+    const end = Math.min(i + CHUNK, input.length);
+    await writer.write(input.subarray(i, end));
+    if (i % (CHUNK * 8) === 0) await yieldToEventLoop();
+  }
   await writer.close();
-  const buf = await new Response(ds.readable).arrayBuffer();
-  return new Uint8Array(buf);
+
+  return await readPromise;
 }
 
-async function deriveAesKey(passphrase: string, salt: Uint8Array, iterations: number): Promise<CryptoKey> {
+async function deriveAesKey(passphrase: string, salt: Uint8Array<ArrayBufferLike>, iterations: number): Promise<CryptoKey> {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
+  const safeSalt = asArrayBufferView(salt);
   return crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
-      salt: toArrayBuffer(salt),
+      salt: safeSalt,
       iterations,
       hash: "SHA-256",
     },
@@ -89,32 +146,221 @@ async function deriveAesKey(passphrase: string, salt: Uint8Array, iterations: nu
   );
 }
 
-export async function encodeQbu(payload: any, opts?: { password?: string; compress?: boolean }): Promise<Uint8Array> {
-  const pass = (opts?.password || "").trim() || DEFAULT_PASSPHRASE;
-  const wantCompress = opts?.compress !== false;
+/**
+ * Encode payload into .qbu bytes.
+ *
+ * - compress: default true (gzip if supported)
+ * - password: optional. If empty, we DO NOT encrypt (fast path).
+ *             If provided, we encrypt with AES-GCM (PBKDF2 derived key).
+ */
+export type QbuEncodeOptions = {
+  password?: string;
+  compress?: boolean;
+  /**
+   * 0.0 .. 1.0 progress callback for large payload packaging.
+   * (Used to keep UI responsive; may be called many times.)
+   */
+  onProgress?: (progress: number) => void;
+};
 
-  const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+async function writeWithTimeout(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  writer: any,
+  chunk: Uint8Array,
+  timeoutMs: number
+): Promise<void> {
+  if (!timeoutMs || timeoutMs <= 0) {
+    await writer.write(chunk);
+    return;
+  }
 
-  let flags = 0;
-  let body: Uint8Array = jsonBytes;
-  if (wantCompress) {
+  let t: any;
+  const timeout = new Promise<never>((_, reject) => {
+    t = setTimeout(() => reject(new Error("gzip_write_timeout")), timeoutMs);
+  });
+
+  try {
+    await Promise.race([writer.write(chunk), timeout]);
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
+
+function isStringArray(value: any): value is string[] {
+  return Array.isArray(value) && (value.length === 0 || typeof value[0] === "string");
+}
+
+/**
+ * For large voxel projects, JSON.stringify(payload) can freeze the UI for a long time.
+ * This builder streams the JSON bytes (and optionally gzip) incrementally.
+ */
+async function buildJsonBody(
+  payload: any,
+  opts: { compress: boolean; onProgress?: (p: number) => void }
+): Promise<{ body: Uint8Array; compressed: boolean }> {
+  const blocksRaw = payload && typeof payload === "object" ? (payload as any).blocks : null;
+  const blocks = isStringArray(blocksRaw) ? blocksRaw : null;
+
+  // Small payloads: keep it simple and fast.
+  const STREAM_THRESHOLD = 500;
+  if (!blocks || blocks.length < STREAM_THRESHOLD) {
+    const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
+    if (!opts.compress) return { body: jsonBytes, compressed: false };
+
     const gz = await gzipCompress(jsonBytes);
-    // If compression isn't supported, gzipCompress returns input unchanged.
-    if (gz !== jsonBytes) {
-      body = gz;
-      flags |= FLAG_GZIP;
+    // gzipCompress returns input unchanged if CompressionStream is unavailable.
+    if (gz !== jsonBytes) return { body: gz, compressed: true };
+    return { body: jsonBytes, compressed: false };
+  }
+
+  const total = blocks.length;
+  const onProgress = opts.onProgress;
+
+  // Split payload into "rest" + blocks array to stream only the heavy part.
+  const rest: any = { ...(payload as any) };
+  delete rest.blocks;
+
+  let head = JSON.stringify(rest);
+  if (head.endsWith("}")) {
+    head = head === "{}" ? '{"blocks":[' : head.slice(0, -1) + ',"blocks":[';
+  } else {
+    head = '{"blocks":[';
+  }
+  const tail = "]}";
+
+  const enc = new TextEncoder();
+  const CHUNK_BLOCKS = 2000;
+
+  // If gzip is requested and supported, stream into CompressionStream.
+  if (opts.compress && typeof (globalThis as any).CompressionStream !== "undefined") {
+    try {
+      const cs = new (globalThis as any).CompressionStream("gzip");
+      const readPromise = readAllBytes(cs.readable);
+      const writer = cs.writable.getWriter();
+
+      // Some browser implementations can hang here on large payloads due to backpressure.
+      // Use a timeout to fall back to the non-gzip path.
+      await writeWithTimeout(writer, enc.encode(head), 2000);
+
+      let lastYield = typeof performance !== "undefined" ? performance.now() : Date.now();
+
+      for (let i = 0; i < total; i += CHUNK_BLOCKS) {
+        const end = Math.min(i + CHUNK_BLOCKS, total);
+
+        const parts: string[] = [];
+        for (let j = i; j < end; j++) parts.push(JSON.stringify(blocks[j]));
+
+        let chunkStr = parts.join(",");
+        if (i > 0) chunkStr = "," + chunkStr;
+
+        await writeWithTimeout(writer, enc.encode(chunkStr), 8000);
+
+        if (onProgress) onProgress(end / total);
+
+        const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+        if (now - lastYield > 16) {
+          lastYield = now;
+          await yieldToEventLoop();
+        }
+      }
+
+      await writeWithTimeout(writer, enc.encode(tail), 8000);
+      await writer.close();
+
+      if (onProgress) onProgress(1);
+
+      const out = await readPromise;
+      return { body: out, compressed: true };
+    } catch (e) {
+      // Fallback to non-gzip path below.
+      // eslint-disable-next-line no-console
+      console.warn("[QBU] gzip packaging failed; falling back to plain JSON.", e);
     }
   }
 
-  // Always encrypt (password is optional; fixed phrase acts as a lightweight obfuscation).
+  // No gzip (or unsupported): build bytes in manageable chunks.
+  const chunks: Uint8Array[] = [];
+  chunks.push(enc.encode(head));
+
+  let lastYield = typeof performance !== "undefined" ? performance.now() : Date.now();
+
+  for (let i = 0; i < total; i += CHUNK_BLOCKS) {
+    const end = Math.min(i + CHUNK_BLOCKS, total);
+
+    const parts: string[] = [];
+    for (let j = i; j < end; j++) parts.push(JSON.stringify(blocks[j]));
+
+    let chunkStr = parts.join(",");
+    if (i > 0) chunkStr = "," + chunkStr;
+
+    chunks.push(enc.encode(chunkStr));
+
+    if (onProgress) onProgress(end / total);
+
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (now - lastYield > 16) {
+      lastYield = now;
+      await yieldToEventLoop();
+    }
+  }
+
+  chunks.push(enc.encode(tail));
+
+  let totalLen = 0;
+  for (const c of chunks) totalLen += c.length;
+
+  const out = new Uint8Array(totalLen);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+
+  return { body: out, compressed: false };
+}
+
+/**
+ * Encode payload into QBU bytes.
+ * - If password is empty: plain (optionally gzipped) package.
+ * - If password is provided: AES-GCM encrypted (PBKDF2 derived key).
+ */
+export async function encodeQbu(payload: any, opts?: QbuEncodeOptions): Promise<Uint8Array> {
+  const rawPass = (opts?.password || "").trim();
+  const wantEncrypt = rawPass.length > 0;
+  const wantCompress = opts?.compress !== false;
+
+  let flags = 0;
+
+  const built = await buildJsonBody(payload, { compress: wantCompress, onProgress: opts?.onProgress });
+  const body = built.body;
+  if (built.compressed) flags |= FLAG_GZIP;
+
+  if (!wantEncrypt) {
+    // Plain (optionally gzipped)
+    const header = new Uint8Array(8);
+    header.set(MAGIC, 0);
+    header[4] = flags; // no encrypted flag
+    header[5] = 0;
+    header[6] = 0;
+    header[7] = 0;
+    return concatBytes(header, body);
+  }
+
+  // Encrypted
   flags |= FLAG_ENCRYPTED;
-  const iterations = 120_000;
+
+  // UX-first: keep reasonably strong but responsive.
+  // (We can raise later if needed; admin can recommend strong password.)
+  const iterations = 60_000;
+
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveAesKey(pass, salt, iterations);
-  const cipher = new Uint8Array(
-    await crypto.subtle.encrypt({ name: "AES-GCM", iv: toArrayBuffer(iv) }, key, toArrayBuffer(body))
-  );
+
+  const key = await deriveAesKey(rawPass, salt, iterations);
+  const safeIv = asArrayBufferView(iv);
+  const safeBody = asArrayBufferView(body);
+  const cipherBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv: safeIv }, key, safeBody);
+  const cipher = new Uint8Array(cipherBuf);
 
   const header = new Uint8Array(40);
   header.set(MAGIC, 0);
@@ -131,7 +377,11 @@ export async function encodeQbu(payload: any, opts?: { password?: string; compre
   return concatBytes(header, cipher);
 }
 
-export async function decodeQbu(bytes: Uint8Array, opts?: { password?: string }): Promise<QbuDecodeResult> {
+/**
+ * Unpack QBU envelope and return decrypted + decompressed body bytes.
+ * (Fast path for huge projects: caller can parse body without JSON.parse on the main thread.)
+ */
+export async function unpackQbu(bytes: Uint8Array, opts?: { password?: string }): Promise<QbuUnpackResult> {
   try {
     if (bytes.length < 8) return { ok: false, error: "qbu_too_small" };
     const magic = bytes.slice(0, 4);
@@ -152,20 +402,34 @@ export async function decodeQbu(bytes: Uint8Array, opts?: { password?: string })
       const iv = bytes.slice(28, 40);
       offset = 40;
       const cipher = bytes.slice(offset);
-      const pass = (opts?.password || "").trim() || DEFAULT_PASSPHRASE;
-      const key = await deriveAesKey(pass, salt, iterations || 120_000);
-      body = new Uint8Array(
-        await crypto.subtle.decrypt({ name: "AES-GCM", iv: toArrayBuffer(iv) }, key, toArrayBuffer(cipher))
-      );
+
+      const rawPass = (opts?.password || "").trim();
+      const pass = rawPass || DEFAULT_PASSPHRASE;
+
+      const key = await deriveAesKey(pass, salt, iterations || 60_000);
+      const safeIv = asArrayBufferView(iv);
+      const safeCipher = asArrayBufferView(cipher);
+      const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv: safeIv }, key, safeCipher);
+      body = new Uint8Array(plainBuf);
     }
 
     if (compressed) {
       body = await gzipDecompress(body);
     }
 
-    const text = new TextDecoder().decode(body);
+    return { ok: true, body, encrypted, compressed };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || "qbu_unpack_failed" };
+  }
+}
+
+export async function decodeQbu(bytes: Uint8Array, opts?: { password?: string }): Promise<QbuDecodeResult> {
+  const unpacked = await unpackQbu(bytes, opts);
+  if (!unpacked.ok) return unpacked;
+  try {
+    const text = new TextDecoder().decode(unpacked.body);
     const payload = JSON.parse(text);
-    return { ok: true, payload, encrypted, compressed };
+    return { ok: true, payload, encrypted: unpacked.encrypted, compressed: unpacked.compressed };
   } catch (e: any) {
     return { ok: false, error: e?.message || "qbu_decode_failed" };
   }

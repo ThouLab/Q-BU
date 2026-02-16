@@ -113,6 +113,7 @@ export default async function AdminLayout({ children }: { children: React.ReactN
           <Link href="/admin/analytics/users">データ分析</Link>
           <Link href="/admin/printing">印刷依頼</Link>
           <Link href="/admin/pricing">価格設定</Link>
+          <Link href="/admin/shipping">送料設定</Link>
           <Link href="/admin/settings">設定</Link>
         </nav>
 

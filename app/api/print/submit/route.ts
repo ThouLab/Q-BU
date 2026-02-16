@@ -5,7 +5,7 @@ import { analyzePrintPrepSupport } from "@/components/qbu/printPrepUtils";
 import { estimatePrintPriceYen, estimateSolidVolumeCm3, resolvePrintScale, type PrintScaleSetting } from "@/components/qbu/printScale";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { getSupabaseServerClient } from "@/lib/supabase/server";
-import { emailHash, encryptShipping, postalCodePrefixFromAddress, type ShippingInfo } from "@/lib/secure/shippingCrypto";
+import { emailHash, encryptShipping, postalCodePrefix, postalCodePrefixFromAddress, type ShippingInfo } from "@/lib/secure/shippingCrypto";
 import { sendOrderEmails } from "@/lib/email/sendOrderEmails";
 import {
   computeDiscountYen,
@@ -14,6 +14,12 @@ import {
   safeTicketType,
   type TicketType,
 } from "@/lib/secure/ticketCode";
+
+import { buildRateMap, fallbackShippingRates, findShippingYen, type ShippingRateRow } from "@/lib/shipping/rates";
+import { deriveSizeTierFromMm, worldSizeToMm } from "@/lib/shipping/sizeTier";
+import { zoneFromPrefecture } from "@/lib/shipping/zones";
+
+import { sendAdminPrintRequestEmail } from "@/lib/email/sendAdminPrintRequestEmail";
 
 export const runtime = "nodejs";
 
@@ -30,6 +36,27 @@ type IncomingDraft = {
 function safeText(x: unknown, maxLen: number): string {
   const s = typeof x === "string" ? x : "";
   return s.trim().slice(0, maxLen);
+}
+
+function getRequestOrigin(request: Request): string | null {
+  // Most reliable in Next route handlers
+  try {
+    const u = new URL(request.url);
+    if (u.origin && u.origin !== "null") return u.origin;
+  } catch {
+    // ignore
+  }
+
+  // Fallbacks for proxy / edge
+  const proto = request.headers.get("x-forwarded-proto") || "https";
+  const host = request.headers.get("x-forwarded-host") || request.headers.get("host") || "";
+  if (host) return `${proto}://${host}`;
+
+  // Last resort: envs
+  const env = process.env.NEXT_PUBLIC_APP_ORIGIN || process.env.APP_ORIGIN || process.env.NEXT_PUBLIC_APP_URL || process.env.APP_URL;
+  if (env) return env;
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+  return null;
 }
 
 function parseScaleSetting(x: unknown, fallbackTargetMm: number): PrintScaleSetting {
@@ -79,6 +106,7 @@ async function resolveLoggedInUserId(): Promise<string | null> {
 }
 
 export async function POST(request: Request) {
+  const appOrigin = getRequestOrigin(request);
   const admin = getSupabaseAdminClient();
   if (!admin) {
     return NextResponse.json({ ok: false, error: "supabase_admin_not_configured" }, { status: 501 });
@@ -107,13 +135,28 @@ export async function POST(request: Request) {
   const name = safeText(customer.name, 80);
   const email = safeText(customer.email, 120);
   const phone = safeText(customer.phone, 40);
-  const address = safeText(customer.address, 400);
+  const postal_code = safeText((customer as any).postal_code, 16);
+  const prefecture = safeText((customer as any).prefecture, 20);
+  const city = safeText((customer as any).city, 40);
+  const town = safeText((customer as any).town, 80);
+  const address_line2 = safeText((customer as any).address_line2, 200);
+
+  // Backward compat: accept either a composed address, or (pref/city/town + line2).
+  let address = safeText(customer.address, 500);
+  if (!address) {
+    const composed = `${prefecture || ""}${city || ""}${town || ""}${address_line2 || ""}`.trim();
+    if (composed) address = composed;
+  }
   const note = safeText(customer.notes, 1000);
 
   const ticketCodeRaw = safeText(customer.ticket_code ?? (customer as any).ticketCode, 80);
 
   if (!name || !email || !address) {
     return NextResponse.json({ ok: false, error: "missing_customer_fields" }, { status: 400 });
+  }
+
+  if (postal_code && !/^\d{3}-?\d{4}$/.test(postal_code)) {
+    return NextResponse.json({ ok: false, error: "invalid_postal_code" }, { status: 400 });
   }
 
   // Identify who (if logged in)
@@ -190,13 +233,69 @@ export async function POST(request: Request) {
   }
 
   const quote = estimatePrintPriceYen(volume, pricingParams);
-  const subtotalBeforeDiscount = quote.subtotalYen;
+  const itemSubtotalYen = quote.subtotalYen;
   const roundingStep = Number(quote.breakdown?.roundingStepYen) || 10;
+
+  // shipping config (v1.0.16)
+  let shippingConfigId: number | null = null;
+  let shippingRates: ShippingRateRow[] = fallbackShippingRates();
+  try {
+    const { data: s, error: se } = await admin
+      .from("shipping_configs")
+      .select("id")
+      .eq("is_active", true)
+      .order("effective_from", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!se && s?.id != null) {
+      const sid = Number((s as any).id);
+      shippingConfigId = Number.isFinite(sid) ? sid : null;
+      if (shippingConfigId != null) {
+        const { data: rows, error: re } = await admin
+          .from("shipping_rates")
+          .select("zone,size_tier,price_yen")
+          .eq("config_id", shippingConfigId)
+          .limit(500);
+        if (!re && Array.isArray(rows) && rows.length) {
+          shippingRates = rows.map((r: any) => ({
+            zone: String(r?.zone || ""),
+            size_tier: String(r?.size_tier || ""),
+            price_yen: Number(r?.price_yen) || 0,
+          }));
+        }
+      }
+    }
+  } catch {
+    // ignore (fallback)
+  }
+
+  // shipping computation: prefecture(zone) + sizeTier
+  let prefForZone = prefecture;
+  if (!prefForZone && address) {
+    const m = address.match(/(北海道|東京都|大阪府|京都府|..県|...県)/);
+    if (m?.[1]) prefForZone = m[1];
+  }
+
+  const shipZone = prefForZone ? zoneFromPrefecture(prefForZone) : null;
+  const sizeMm = worldSizeToMm((bbox as any).size, resolved.mmPerUnit);
+  const tierInfo = deriveSizeTierFromMm(sizeMm, { paddingMm: 20 });
+  const shipTier = tierInfo.sizeTier;
+
+  const shipMap = buildRateMap(shippingRates);
+  let shippingYen: number | null = shipZone ? findShippingYen(shipMap, shipZone, shipTier) : null;
+  if (shippingYen == null && shipZone) {
+    const fbMap = buildRateMap(fallbackShippingRates());
+    shippingYen = findShippingYen(fbMap, shipZone, shipTier);
+  }
+  if (shippingYen == null) shippingYen = 0;
+
+  const totalBeforeDiscountYen = itemSubtotalYen + shippingYen;
 
   // ticket validation + discount
   let ticketId: string | null = null;
+  let ticketApplyScope: string | null = null;
   let discountAppliedYen = 0;
-  let finalTotalYen = subtotalBeforeDiscount;
+  let finalTotalYen = totalBeforeDiscountYen;
   let ticketType: TicketType | null = null;
   let ticketValue: number | null = null;
 
@@ -270,11 +369,22 @@ export async function POST(request: Request) {
     ticketType = tt;
     ticketValue = t.value != null ? Number(t.value) : null;
 
-    const wanted = computeDiscountYen({ type: tt, value: ticketValue, subtotalYen: subtotalBeforeDiscount });
-    const rawFinal = Math.max(0, subtotalBeforeDiscount - wanted);
+    // v1.0.16: percent/fixed/free can be applied to "subtotal" or "total" (subtotal+shipping)
+    ticketApplyScope = t.apply_scope === "total" ? "total" : "subtotal";
+    const shipping_free = Boolean(t.shipping_free);
+
+    const wanted = computeDiscountYen({
+      type: tt,
+      value: ticketValue,
+      subtotalYen: itemSubtotalYen,
+      shippingYen,
+      applyScope: ticketApplyScope,
+      shipping_free,
+    });
+    const rawFinal = Math.max(0, totalBeforeDiscountYen - wanted);
     const roundedFinal = roundToStepYen(rawFinal, roundingStep);
     finalTotalYen = roundedFinal;
-    discountAppliedYen = Math.max(0, subtotalBeforeDiscount - roundedFinal);
+    discountAppliedYen = Math.max(0, totalBeforeDiscountYen - roundedFinal);
   }
 
   // secure shipping
@@ -282,6 +392,11 @@ export async function POST(request: Request) {
     name,
     email,
     phone: phone || undefined,
+    postal_code: postal_code || undefined,
+    prefecture: prefecture || undefined,
+    city: city || undefined,
+    town: town || undefined,
+    address_line2: address_line2 || undefined,
     address,
   };
 
@@ -293,7 +408,7 @@ export async function POST(request: Request) {
   }
 
   const email_hash = emailHash(email) || null;
-  const postal_prefix = postalCodePrefixFromAddress(address);
+  const postal_prefix = postalCodePrefix(postal_code) || postalCodePrefixFromAddress(address);
 
   const app_version = process.env.NEXT_PUBLIC_APP_VERSION || "dev";
 
@@ -301,13 +416,27 @@ export async function POST(request: Request) {
   const breakdown: any = {
     ...quote.breakdown,
   };
+
+  breakdown.itemSubtotalYen = itemSubtotalYen;
+  breakdown.shipping = {
+    configId: shippingConfigId,
+    zone: shipZone,
+    sizeTier: shipTier,
+    yen: shippingYen,
+    sumCm: tierInfo.sumCm,
+    cappedTier: tierInfo.capped,
+  };
+  breakdown.totalBeforeDiscountYen = totalBeforeDiscountYen;
+  breakdown.totalYen = finalTotalYen;
+
   if (ticketId) {
-    breakdown.preDiscountYen = subtotalBeforeDiscount;
+    breakdown.preDiscountYen = totalBeforeDiscountYen;
     breakdown.discountYen = discountAppliedYen;
     breakdown.ticket = {
       id: ticketId,
       type: ticketType,
       value: ticketValue,
+      apply_scope: ticketApplyScope,
     };
   }
 
@@ -323,9 +452,16 @@ export async function POST(request: Request) {
 
     pricing_config_id: pricingConfigId,
 
+    // shipping snapshot (v1.0.16)
+    shipping_config_id: shippingConfigId,
+    shipping_zone: shipZone,
+    shipping_size_tier: shipTier,
+    shipping_yen: shippingYen,
+    ticket_apply_scope: ticketId ? ticketApplyScope : null,
+
     // snapshot
     quote_total_yen: finalTotalYen,
-    quote_subtotal_yen: subtotalBeforeDiscount,
+    quote_subtotal_yen: itemSubtotalYen,
     discount_yen: ticketId ? discountAppliedYen : null,
     ticket_id: ticketId,
 
@@ -415,7 +551,10 @@ export async function POST(request: Request) {
         snapshot: {
           type: ticketType,
           value: ticketValue,
-          subtotal_before: subtotalBeforeDiscount,
+          apply_scope: ticketApplyScope,
+          item_subtotal_before: itemSubtotalYen,
+          shipping_yen: shippingYen,
+          total_before: totalBeforeDiscountYen,
           total_after: finalTotalYen,
         },
       } as any);
@@ -438,15 +577,21 @@ export async function POST(request: Request) {
       payload: {
         order_id: orderId,
         pricing_config_id: pricingConfigId,
+        shipping_config_id: shippingConfigId,
         model_fingerprint: modelFingerprint,
         block_count: baseSet.size,
         support_block_count: supSet.size,
         max_side_mm: resolved.maxSideMm,
         mm_per_unit: resolved.mmPerUnit,
         scale_mode: resolved.mode,
-        quote_subtotal_yen: subtotalBeforeDiscount,
+        quote_subtotal_yen: itemSubtotalYen,
+        shipping_yen: shippingYen,
+        total_before_discount_yen: totalBeforeDiscountYen,
         discount_yen: discountAppliedYen,
         ticket_id: ticketId,
+        ticket_apply_scope: ticketApplyScope,
+        shipping_zone: shipZone,
+        shipping_size_tier: shipTier,
         quote_total_yen: finalTotalYen,
         warn_too_large: Boolean(resolved.warnTooLarge),
       },
@@ -459,26 +604,71 @@ export async function POST(request: Request) {
 
   // transactional emails (order received + invoice)
   try {
-    await sendOrderEmails({
-      to: email,
-      customerName: name,
-      orderId,
-      createdAt: new Date().toISOString(),
-      modelName: baseName,
-      modelFingerprint,
-      sizeMaxMm: Number(resolved.maxSideMm),
-      mmPerUnit: Number(resolved.mmPerUnit),
-      blockCount: baseSet.size,
-      supportBlockCount: supSet.size,
-      volumeCm3: Number(quote.volumeCm3),
-      subtotalYen: subtotalBeforeDiscount,
-      discountYen: discountAppliedYen,
-      totalYen: finalTotalYen,
-      ticketCodeUsed: ticketCodeRaw || null,
-    });
+    const createdAtIso = new Date().toISOString();
+    await Promise.all([
+      sendOrderEmails({
+        to: email,
+        customerName: name,
+        orderId,
+        createdAt: createdAtIso,
+        modelName: baseName,
+        modelFingerprint,
+        sizeMaxMm: Number(resolved.maxSideMm),
+        mmPerUnit: Number(resolved.mmPerUnit),
+        blockCount: baseSet.size,
+        supportBlockCount: supSet.size,
+        volumeCm3: Number(quote.volumeCm3),
+        itemSubtotalYen,
+        shippingYen,
+        totalBeforeDiscountYen,
+        discountYen: discountAppliedYen,
+        totalYen: finalTotalYen,
+        ticketApplyScope,
+        shippingZone: shipZone,
+        shippingSizeTier: shipTier,
+        ticketCodeUsed: ticketCodeRaw || null,
+      }),
+      sendAdminPrintRequestEmail({
+        orderId,
+        createdAt: createdAtIso,
+        modelName: baseName,
+        appOrigin,
+        customer: {
+          name,
+          email,
+          phone: phone || undefined,
+          postal_code: postal_code || undefined,
+          address,
+        },
+        quote: {
+          item_subtotal_yen: itemSubtotalYen,
+          shipping_yen: shippingYen,
+          total_before_discount_yen: totalBeforeDiscountYen,
+          discount_yen: discountAppliedYen,
+          total_yen: finalTotalYen,
+          ticket_apply_scope: ticketApplyScope,
+          shipping_zone: shipZone,
+          shipping_size_tier: shipTier,
+        },
+      }),
+    ]);
   } catch {
     // do not fail the request if emails are misconfigured
   }
 
-  return NextResponse.json({ ok: true, order_id: orderId, discount_yen: discountAppliedYen, ticket_id: ticketId });
+  return NextResponse.json({
+    ok: true,
+    order_id: orderId,
+    quote: {
+      item_subtotal_yen: itemSubtotalYen,
+      shipping_yen: shippingYen,
+      total_before_discount_yen: totalBeforeDiscountYen,
+      discount_yen: discountAppliedYen,
+      total_yen: finalTotalYen,
+      ticket_apply_scope: ticketApplyScope,
+      shipping_zone: shipZone,
+      shipping_size_tier: shipTier,
+    },
+    ticket_id: ticketId,
+  });
 }

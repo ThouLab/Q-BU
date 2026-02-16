@@ -63,25 +63,38 @@ export function safeTicketType(v: any): TicketType | null {
 export function computeDiscountYen(args: {
   type: TicketType;
   value: number | null;
+  /** 商品小計（送料別） */
   subtotalYen: number;
+  /** 送料（省略時は0円） */
+  shippingYen?: number | null;
+  /** percent/fixed/free を送料込み合計に適用するか */
+  applyScope?: "subtotal" | "total" | string | null;
+  /** 互換: shipping_free フラグ（旧実装向け） */
+  shipping_free?: boolean | null;
 }): number {
-  const subtotal = Math.max(0, Math.round(args.subtotalYen || 0));
-  if (subtotal <= 0) return 0;
+  const subtotal = Math.max(0, Math.round(Number(args.subtotalYen) || 0));
+  const shipping = Math.max(0, Math.round(Number(args.shippingYen ?? 0) || 0));
+  if (subtotal <= 0 && shipping <= 0) return 0;
 
-  if (args.type === "free") return subtotal;
-  if (args.type === "shipping_free") return 0; // shipping is not modeled yet
+  const applyScope = args.applyScope === "total" ? "total" : "subtotal";
+  const base = applyScope === "total" ? subtotal + shipping : subtotal;
+
+  const isShippingFree = args.type === "shipping_free" || args.shipping_free === true;
+  if (isShippingFree) return shipping;
+
+  if (args.type === "free") return base;
 
   if (args.type === "percent") {
     const pct = Number(args.value);
     if (!Number.isFinite(pct)) return 0;
     const p = Math.max(0, Math.min(100, pct));
-    return Math.floor((subtotal * p) / 100);
+    return Math.floor((base * p) / 100);
   }
 
   // fixed
   const fixed = Number(args.value);
   if (!Number.isFinite(fixed)) return 0;
-  return Math.max(0, Math.min(subtotal, Math.round(fixed)));
+  return Math.max(0, Math.min(base, Math.round(fixed)));
 }
 
 export function roundToStepYen(amountYen: number, stepYen: number): number {

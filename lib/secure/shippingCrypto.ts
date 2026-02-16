@@ -4,6 +4,14 @@ export type ShippingInfo = {
   name: string;
   email: string;
   phone?: string;
+  /** e.g. "123-4567" */
+  postal_code?: string;
+  /** prefecture/city/town resolved by postal lookup (optional) */
+  prefecture?: string;
+  city?: string;
+  town?: string;
+  /** street/building etc (optional) */
+  address_line2?: string;
   address: string;
 };
 
@@ -32,6 +40,13 @@ export function postalCodePrefixFromAddress(address: string): string | null {
   const a = (address || "").trim();
   if (!a) return null;
   const m = a.match(/\b(\d{3})-?(\d{4})\b/);
+  if (!m) return null;
+  return m[1] || null;
+}
+
+export function postalCodePrefix(code: string): string | null {
+  const s = String(code || "").trim();
+  const m = s.match(/^(\d{3})-?(\d{4})$/);
   if (!m) return null;
   return m[1] || null;
 }
@@ -130,6 +145,11 @@ export function decryptShipping(token: string): ShippingInfo {
     name: typeof obj?.name === "string" ? obj.name : "",
     email: typeof obj?.email === "string" ? obj.email : "",
     phone: typeof obj?.phone === "string" ? obj.phone : undefined,
+    postal_code: typeof obj?.postal_code === "string" ? obj.postal_code : undefined,
+    prefecture: typeof obj?.prefecture === "string" ? obj.prefecture : undefined,
+    city: typeof obj?.city === "string" ? obj.city : undefined,
+    town: typeof obj?.town === "string" ? obj.town : undefined,
+    address_line2: typeof obj?.address_line2 === "string" ? obj.address_line2 : undefined,
     address: typeof obj?.address === "string" ? obj.address : "",
   };
 }

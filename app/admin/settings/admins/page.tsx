@@ -36,7 +36,7 @@ export default async function AdminSettingsAdmins() {
 
   const listRes = await admin
     .from("admin_roles")
-    .select("user_id,role,is_active,created_at,updated_at")
+    .select("user_id,role,is_active,notify_print_request,created_at,updated_at")
     .order("updated_at", { ascending: false });
 
   const roles = (listRes.data as any[] | null) ?? [];
@@ -44,6 +44,7 @@ export default async function AdminSettingsAdmins() {
     user_id: String(r.user_id),
     role: (r.role as any) || "admin",
     is_active: Boolean(r.is_active),
+    notify_print_request: Boolean(r.notify_print_request),
     created_at: r.created_at ?? undefined,
     updated_at: r.updated_at ?? undefined,
   }));

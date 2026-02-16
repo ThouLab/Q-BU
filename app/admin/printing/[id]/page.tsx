@@ -22,6 +22,9 @@ type OrderRow = {
   scale_mode: string | null;
   quote_total_yen: number | null;
   quote_subtotal_yen?: number | null;
+  shipping_yen?: number | null;
+  shipping_zone?: string | null;
+  shipping_size_tier?: string | null;
   discount_yen?: number | null;
   ticket_id?: string | null;
   quote_volume_cm3: number | string | null;
@@ -88,6 +91,8 @@ export default async function AdminPrintOrderDetail({ params }: { params: Promis
 
   const discount = Number(order.discount_yen || 0);
   const subtotal = order.quote_subtotal_yen != null ? Number(order.quote_subtotal_yen) : null;
+  const ship = order.shipping_yen != null ? Number(order.shipping_yen) : null;
+  const before = subtotal != null ? subtotal + (ship || 0) : null;
 
   return (
     <div>
@@ -146,10 +151,15 @@ export default async function AdminPrintOrderDetail({ params }: { params: Promis
               {order.quote_total_yen != null ? (
                 <>
                   <b>{fmtYen(order.quote_total_yen)}円</b>
-                  <span className="adminMuted">（推定体積 {fmtNum(order.quote_volume_cm3, 1)}cm³ / 送料別）</span>
+                  <span className="adminMuted">（推定体積 {fmtNum(order.quote_volume_cm3, 1)}cm³ / 送料込み）</span>
+                  {subtotal != null && ship != null && (
+                    <div className="adminMuted" style={{ marginTop: 6 }}>
+                      小計 {fmtYen(subtotal)}円 / 送料 {fmtYen(ship)}円{order.shipping_zone && order.shipping_size_tier ? `（${order.shipping_zone}/${order.shipping_size_tier}）` : ""}
+                    </div>
+                  )}
                   {discount > 0 && (
                     <div className="adminMuted" style={{ marginTop: 6 }}>
-                      割引 -{fmtYen(discount)}円{subtotal != null ? `（元 ${fmtYen(subtotal)}円）` : ""}
+                      割引 -{fmtYen(discount)}円{before != null ? `（元 ${fmtYen(before)}円）` : ""}
                     </div>
                   )}
                 </>

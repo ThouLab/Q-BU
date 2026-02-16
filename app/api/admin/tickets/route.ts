@@ -45,7 +45,9 @@ export async function GET() {
 
   const res = await admin
     .from("v_tickets_with_usage")
-    .select("id,created_at,created_by,type,code_prefix,value,currency,is_active,expires_at,max_total_uses,max_uses_per_user,constraints,note,used_total")
+    .select(
+      "id,created_at,created_by,type,apply_scope,shipping_free,code_prefix,value,currency,is_active,expires_at,max_total_uses,max_uses_per_user,constraints,note,used_total"
+    )
     .order("created_at", { ascending: false })
     .limit(200);
 
@@ -114,6 +116,8 @@ export async function POST(request: Request) {
 
   const note = typeof body?.note === "string" ? body.note.trim().slice(0, 200) : null;
   const constraints = parseJsonMaybe(body?.constraints);
+  const apply_scope = body?.apply_scope === "total" ? "total" : "subtotal";
+  const shipping_free = Boolean(body?.shipping_free);
 
   // Create code (shown once)
   const code = generateTicketCode();
@@ -125,6 +129,8 @@ export async function POST(request: Request) {
     .insert({
       created_by: gate.admin.userId,
       type: type as TicketType,
+      apply_scope,
+      shipping_free,
       value,
       currency: "JPY",
       code_hash,
@@ -136,7 +142,9 @@ export async function POST(request: Request) {
       constraints,
       note,
     })
-    .select("id,created_at,created_by,type,code_prefix,value,currency,is_active,expires_at,max_total_uses,max_uses_per_user,constraints,note")
+    .select(
+      "id,created_at,created_by,type,apply_scope,shipping_free,code_prefix,value,currency,is_active,expires_at,max_total_uses,max_uses_per_user,constraints,note"
+    )
     .single();
 
   if (insertRes.error || !insertRes.data) {

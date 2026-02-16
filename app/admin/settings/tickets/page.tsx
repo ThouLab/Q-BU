@@ -36,7 +36,9 @@ export default async function AdminSettingsTickets() {
 
   const res = await admin
     .from("v_tickets_with_usage")
-    .select("id,created_at,type,code_prefix,value,currency,is_active,expires_at,max_total_uses,max_uses_per_user,constraints,note,used_total")
+    .select(
+      "id,created_at,type,apply_scope,shipping_free,code_prefix,value,currency,is_active,expires_at,max_total_uses,max_uses_per_user,constraints,note,used_total"
+    )
     .order("created_at", { ascending: false })
     .limit(200);
 
@@ -45,6 +47,8 @@ export default async function AdminSettingsTickets() {
     id: String(t.id),
     created_at: t.created_at ?? undefined,
     type: t.type as any,
+    apply_scope: t.apply_scope ?? null,
+    shipping_free: Boolean(t.shipping_free),
     code_prefix: t.code_prefix ?? null,
     value: t.value != null ? Number(t.value) : null,
     currency: t.currency ?? null,

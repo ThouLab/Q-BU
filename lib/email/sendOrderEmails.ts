@@ -10,9 +10,17 @@ type SendOrderEmailsInput = {
   blockCount: number;
   supportBlockCount: number;
   volumeCm3: number;
-  subtotalYen: number;
+  /** 商品小計（送料別） */
+  itemSubtotalYen: number;
+  /** 送料 */
+  shippingYen: number;
+  /** 小計 + 送料 */
+  totalBeforeDiscountYen: number;
   discountYen: number;
   totalYen: number;
+  ticketApplyScope: string | null;
+  shippingZone: string | null;
+  shippingSizeTier: string | null;
   ticketCodeUsed: string | null;
 };
 
@@ -70,7 +78,15 @@ function buildInvoiceHtml(input: SendOrderEmailsInput) {
   const invoiceNo = `QB-${input.orderId.slice(0, 8)}`;
   const discountLine = input.discountYen > 0 ? `<tr><td style="padding:6px 0;">割引</td><td style="padding:6px 0; text-align:right;">- ${yen(input.discountYen)} 円</td></tr>` : "";
 
-  const ticketInfo = input.ticketCodeUsed ? `<div style="color:#6b7280; font-size:12px; margin-top:6px;">適用チケット: ${safeText(input.ticketCodeUsed)}</div>` : "";
+  const shippingMeta =
+    input.shippingZone && input.shippingSizeTier
+      ? ` <span style="color:#6b7280; font-size:12px;">(${safeText(input.shippingZone)}/${safeText(input.shippingSizeTier)})</span>`
+      : "";
+
+  const ticketInfo =
+    input.ticketCodeUsed
+      ? `<div style="color:#6b7280; font-size:12px; margin-top:6px;">適用チケット: ${safeText(input.ticketCodeUsed)}${input.ticketApplyScope ? ` / 範囲: ${safeText(input.ticketApplyScope)}` : ""}</div>`
+      : "";
 
   const payInfo =
     bankName || bankBranch || accountType || accountNumber || accountName
@@ -140,11 +156,15 @@ function buildInvoiceHtml(input: SendOrderEmailsInput) {
         <tbody>
           <tr>
             <td style="padding:6px 0;">3Dプリント制作（推定体積 ${mm(input.volumeCm3, 1)}cm³）</td>
-            <td style="padding:6px 0; text-align:right;">${yen(input.subtotalYen)} 円</td>
+            <td style="padding:6px 0; text-align:right;">${yen(input.itemSubtotalYen)} 円</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 0;">送料${shippingMeta}</td>
+            <td style="padding:6px 0; text-align:right;">${yen(input.shippingYen)} 円</td>
           </tr>
           ${discountLine}
           <tr>
-            <td style="padding:8px 0; font-weight:900; border-top:1px solid rgba(0,0,0,0.12);">合計（送料別）</td>
+            <td style="padding:8px 0; font-weight:900; border-top:1px solid rgba(0,0,0,0.12);">合計</td>
             <td style="padding:8px 0; text-align:right; font-weight:900; border-top:1px solid rgba(0,0,0,0.12);">${yen(input.totalYen)} 円</td>
           </tr>
         </tbody>
@@ -152,7 +172,7 @@ function buildInvoiceHtml(input: SendOrderEmailsInput) {
       ${ticketInfo}
       ${payInfo}
       <div style="margin-top:10px; color:#6b7280; font-size:12px;">
-        ※送料は配送先により別途ご案内します。制作開始後のキャンセルは原則お受けできません。
+        ※概算です（材料・肉厚・充填率・造形方式などで変動します）。制作開始後のキャンセルは原則お受けできません。
       </div>
     </div>
 

@@ -6,6 +6,7 @@ export type AdminRoleRow = {
   user_id: string;
   role: "owner" | "admin" | "ops" | "analyst";
   is_active: boolean;
+  notify_print_request?: boolean;
   created_at?: string;
   updated_at?: string;
 };
@@ -36,6 +37,7 @@ export default function AdminRolesClient(props: {
   const [newUserId, setNewUserId] = useState("");
   const [newRole, setNewRole] = useState<AdminRoleRow["role"]>("admin");
   const [newActive, setNewActive] = useState(true);
+  const [newNotify, setNewNotify] = useState(false);
 
   const sorted = useMemo(() => {
     const copy = [...roles];
@@ -74,6 +76,7 @@ export default function AdminRolesClient(props: {
           user_id: row.user_id,
           role: row.role,
           is_active: row.is_active,
+          notify_print_request: Boolean(row.notify_print_request),
         }),
       });
       const data = await res.json().catch(() => null);
@@ -95,7 +98,7 @@ export default function AdminRolesClient(props: {
       setError("user_id を入力してください");
       return;
     }
-    await upsert({ user_id: u, role: newRole, is_active: newActive });
+    await upsert({ user_id: u, role: newRole, is_active: newActive, notify_print_request: newNotify });
     setNewUserId("");
   };
 
@@ -140,6 +143,11 @@ export default function AdminRolesClient(props: {
               有効
             </label>
 
+            <label style={{ display: "flex", gap: 6, alignItems: "center", fontWeight: 800 }}>
+              <input type="checkbox" checked={newNotify} onChange={(e) => setNewNotify(e.target.checked)} />
+              通知対象
+            </label>
+
             <button
               type="button"
               onClick={addNew}
@@ -172,6 +180,7 @@ export default function AdminRolesClient(props: {
             <th>user_id</th>
             <th>role</th>
             <th>active</th>
+            <th>通知</th>
             <th>updated</th>
             {canEdit ? <th>操作</th> : null}
           </tr>
@@ -222,6 +231,22 @@ export default function AdminRolesClient(props: {
                   )}
                 </td>
 
+                <td>
+                  {canEdit ? (
+                    <input
+                      type="checkbox"
+                      checked={Boolean(r.notify_print_request)}
+                      onChange={(e) =>
+                        setRoles((prev) => prev.map((x) => (x.user_id === r.user_id ? { ...x, notify_print_request: e.target.checked } : x)))
+                      }
+                    />
+                  ) : r.notify_print_request ? (
+                    <span className="adminChip">on</span>
+                  ) : (
+                    <span className="adminMuted">-</span>
+                  )}
+                </td>
+
                 <td style={{ whiteSpace: "nowrap" }}>{fmtTs(r.updated_at)}</td>
 
                 {canEdit ? (
@@ -242,7 +267,7 @@ export default function AdminRolesClient(props: {
 
           {sorted.length === 0 && (
             <tr>
-              <td colSpan={canEdit ? 5 : 4} className="adminMuted">
+              <td colSpan={canEdit ? 6 : 5} className="adminMuted">
                 まだ管理者が登録されていません。
               </td>
             </tr>

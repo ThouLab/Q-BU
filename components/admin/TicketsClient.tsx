@@ -6,6 +6,8 @@ export type TicketRow = {
   id: string;
   created_at?: string;
   type: "percent" | "fixed" | "free" | "shipping_free";
+  apply_scope?: "subtotal" | "total" | string | null;
+  shipping_free?: boolean | null;
   code_prefix?: string | null;
   value?: number | null;
   currency?: string | null;
@@ -55,6 +57,7 @@ export default function TicketsClient(props: {
   // create form
   const [type, setType] = useState<TicketRow["type"]>("percent");
   const [value, setValue] = useState<string>("20");
+  const [applyScope, setApplyScope] = useState<string>("subtotal");
   const [expiresAt, setExpiresAt] = useState<string>("");
   const [maxTotalUses, setMaxTotalUses] = useState<string>("");
   const [maxPerUser, setMaxPerUser] = useState<string>("1");
@@ -91,6 +94,8 @@ export default function TicketsClient(props: {
     try {
       const payload: any = {
         type,
+        apply_scope: applyScope === "total" ? "total" : "subtotal",
+        shipping_free: type === "shipping_free",
         note: note.trim(),
         max_total_uses: maxTotalUses.trim(),
         max_uses_per_user: maxPerUser.trim(),
@@ -170,8 +175,22 @@ export default function TicketsClient(props: {
               <option value="percent">%割引</option>
               <option value="fixed">固定額割引</option>
               <option value="free">無料</option>
-              <option value="shipping_free">送料0（未実装）</option>
+              <option value="shipping_free">送料0</option>
             </select>
+
+            {(type === "percent" || type === "fixed" || type === "free") && (
+              <label style={{ fontWeight: 900 }}>
+                適用範囲
+                <select
+                  value={applyScope}
+                  onChange={(e) => setApplyScope(e.target.value)}
+                  style={{ marginLeft: 8, padding: 10, borderRadius: 10, border: "1px solid rgba(0,0,0,0.18)", fontWeight: 900 }}
+                >
+                  <option value="subtotal">送料別（小計）</option>
+                  <option value="total">送料込み（合計）</option>
+                </select>
+              </label>
+            )}
 
             {(type === "percent" || type === "fixed") && (
               <input
@@ -254,6 +273,7 @@ export default function TicketsClient(props: {
             <th>作成</th>
             <th>種別</th>
             <th>値</th>
+            <th>範囲</th>
             <th>prefix</th>
             <th>使用</th>
             <th>期限</th>
@@ -273,6 +293,9 @@ export default function TicketsClient(props: {
                 <td style={{ whiteSpace: "nowrap" }}>{fmtTs(t.created_at || null)}</td>
                 <td><span className="adminChip">{t.type}</span></td>
                 <td style={{ whiteSpace: "nowrap" }}>{fmtValue(t)}</td>
+                <td style={{ whiteSpace: "nowrap" }}>
+                  {t.type === "shipping_free" ? <span className="adminMuted">-</span> : <span className="adminChip">{String(t.apply_scope || "subtotal")}</span>}
+                </td>
                 <td>{t.code_prefix ? <span className="adminKbd">{t.code_prefix}</span> : "-"}</td>
                 <td style={{ whiteSpace: "nowrap" }}>
                   {used.toLocaleString("ja-JP")}
@@ -302,7 +325,7 @@ export default function TicketsClient(props: {
 
           {sorted.length === 0 && (
             <tr>
-              <td colSpan={canEdit ? 9 : 8} className="adminMuted">
+              <td colSpan={canEdit ? 10 : 9} className="adminMuted">
                 まだチケットがありません。
               </td>
             </tr>

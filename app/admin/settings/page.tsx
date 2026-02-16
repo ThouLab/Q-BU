@@ -13,6 +13,7 @@ export default async function AdminSettings() {
         <Link href="/admin">← 総合ダッシュボード</Link>
         <Link href="/admin/printing">印刷依頼</Link>
         <Link href="/admin/pricing">価格設定</Link>
+        <Link href="/admin/shipping">送料設定</Link>
       </div>
 
       <div className="adminCards" style={{ marginTop: 12, gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
@@ -35,6 +36,17 @@ export default async function AdminSettings() {
           </div>
           <div style={{ marginTop: 10 }}>
             <Link href="/admin/settings/tickets" style={{ fontWeight: 900 }}>チケット設定へ →</Link>
+          </div>
+        </div>
+
+        <div className="adminCard">
+          <div className="adminCardLabel">C3. 送料設定（v1.0.16）</div>
+          <div className="adminCardValue" style={{ fontSize: 16 }}>ゾーン × サイズTier</div>
+          <div className="adminMuted" style={{ marginTop: 8 }}>
+            郵便番号検索で確定した配送先（都道府県）とサイズTierから配送料を計算します。
+          </div>
+          <div style={{ marginTop: 10 }}>
+            <Link href="/admin/shipping" style={{ fontWeight: 900 }}>送料設定へ →</Link>
           </div>
         </div>
       </div>
