@@ -1,20 +1,21 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import * as THREE from "three";
 import { STLExporter } from "three/examples/jsm/exporters/STLExporter.js";
 
 import VoxelEditor from "@/components/qbu/VoxelEditor";
 import VoxelPreview from "@/components/qbu/VoxelPreview";
 import SaveModal from "@/components/qbu/SaveModal";
-import MyModelsModal from "@/components/qbu/MyModelsModal";
 import PrintPrepModal from "@/components/qbu/PrintPrepModal";
 import { useTelemetry } from "@/components/telemetry/TelemetryProvider";
 import { useAuth } from "@/components/auth/AuthProvider";
+import { useI18n } from "@/components/i18n/I18nProvider";
 import { computeBBox, keyOf, parseKey } from "@/components/qbu/voxelUtils";
 import { computeMixedBBox, parseSubKey, subMinToWorldCenter, type SubKey } from "@/components/qbu/subBlocks";
 import { DEFAULT_REF_SETTINGS, type ViewDir } from "@/components/qbu/settings";
-import { DEFAULT_CUBE_COLOR } from "@/components/qbu/filamentColors";
+import { DEFAULT_BLOCK_COLOR } from "@/components/qbu/filamentColors";
 import { readFileAsDataURL, splitThreeViewSheet, type RefImages } from "@/components/qbu/referenceUtils";
 import { countComponents } from "@/components/qbu/printPrepUtils";
 import { resolvePrintScale, type PrintScaleSetting } from "@/components/qbu/printScale";
@@ -25,6 +26,10 @@ const STORAGE_KEY = "qbu_project_v1";
 const DRAFT_KEY = "qbu_draft_v2";
 const PENDING_SAVE_KEY = "qbu_pending_save_v1";
 const PRINT_DRAFT_KEY = "qbu_print_draft_v1";
+const OPEN_MODEL_KEY = "qbu_open_model_id_v1";
+const OPEN_MODEL_COPY_KEY = "qbu_open_model_copy_v1";
+const CURRENT_MODEL_ID_KEY = "qbu_current_model_id_v1";
+const CURRENT_MODEL_NAME_KEY = "qbu_current_model_name_v1";
 const DEFAULT_TARGET_MM = 50; // 5cm
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -175,6 +180,9 @@ function sampleSetForThumb(src: Set<string>, max = 12000): Set<string> {
 }
 type FastParsedProject = {
   blocks: Set<string>;
+  /** v1.0.17+ : per-block colors (key -> hex) */
+  colors?: Map<string, string>;
+  /** Legacy : single color (v1.0.16以前) */
   color?: string;
   edges?: boolean;
   version?: number;
@@ -184,6 +192,7 @@ type FastParsedProject = {
 // JSON field patterns (ASCII)
 // "blocks" / "color" / "edges" / "version" / "kind"
 const PAT_BLOCKS = new Uint8Array([34, 98, 108, 111, 99, 107, 115, 34]);
+const PAT_COLORS = new Uint8Array([34, 99, 111, 108, 111, 114, 115, 34]);
 const PAT_COLOR = new Uint8Array([34, 99, 111, 108, 111, 114, 34]);
 const PAT_EDGES = new Uint8Array([34, 101, 100, 103, 101, 115, 34]);
 const PAT_VERSION = new Uint8Array([34, 118, 101, 114, 115, 105, 111, 110, 34]);
@@ -409,11 +418,26 @@ async function parseJsonProjectBody(
     const text = new TextDecoder().decode(body);
     const obj = JSON.parse(text);
     const blocksArr: string[] = Array.isArray(obj?.blocks) ? obj.blocks : [];
+    const colorsArr: unknown[] | null = Array.isArray(obj?.colors) ? obj.colors : null;
     const blocks = new Set<string>();
+    const colorsMap = colorsArr ? new Map<string, string>() : undefined;
     for (const k of blocksArr) if (typeof k === "string") blocks.add(k);
     if (blocks.size === 0) blocks.add(keyOf({ x: 0, y: 0, z: 0 }));
+
+    // v5+: blocks/colors are aligned by index.
+    if (colorsArr && colorsMap) {
+      const legacy = typeof obj?.color === "string" ? obj.color : color || DEFAULT_BLOCK_COLOR;
+      for (let i = 0; i < blocksArr.length; i++) {
+        const k = blocksArr[i];
+        if (typeof k !== "string") continue;
+        const c = colorsArr[i];
+        colorsMap.set(k, typeof c === "string" ? c : legacy);
+      }
+      if (colorsMap.size === 0) colorsMap.set(keyOf({ x: 0, y: 0, z: 0 }), legacy);
+    }
     return {
       blocks,
+      colors: colorsMap,
       color: typeof obj?.color === "string" ? obj.color : color,
       edges: typeof obj?.edges === "boolean" ? obj.edges : edges,
       version: typeof obj?.version === "number" ? obj.version : version,
@@ -504,6 +528,78 @@ async function parseJsonProjectBody(
 
   if (blocks.size === 0) blocks.add(keyOf({ x: 0, y: 0, z: 0 }));
 
+  // === v5+: parse colors array (format A: blocks[] + colors[] aligned) ===
+  // Use insertion order of Set (same as JSON array order) to align.
+  let colorsMap: Map<string, string> | undefined;
+  const idxColors = findPattern(body, PAT_COLORS, i, end);
+  if (idxColors >= 0) {
+    colorsMap = new Map<string, string>();
+
+    // find '[' after "colors":
+    let ci = idxColors + PAT_COLORS.length;
+    ci = findByte(body, 0x3a, ci, end);
+    if (ci >= 0) {
+      ci++;
+      ci = skipWs(body, ci, end);
+      ci = findByte(body, 0x5b, ci, end); // '['
+    }
+    if (ci >= 0) {
+      ci++; // after '['
+
+      const it = blocks.values();
+      const dec = new TextDecoder();
+      let colorCount = 0;
+      let lastUi2 = 0;
+
+      while (ci < end) {
+        // skip ws and commas
+        while (ci < end) {
+          const c = body[ci];
+          if (c === 0x2c || c === 0x20 || c === 0x0a || c === 0x0d || c === 0x09) {
+            ci++;
+            continue;
+          }
+          break;
+        }
+        if (ci >= end) break;
+        if (body[ci] === 0x5d) break; // ']'
+
+        if (body[ci] !== 0x22) {
+          ci++;
+          continue;
+        }
+        ci++; // skip '"'
+        const start = ci;
+        ci = findByte(body, 0x22, ci, end);
+        if (ci < 0) break;
+        const col = dec.decode(body.subarray(start, ci));
+        ci++; // after closing quote
+
+        const bk = it.next();
+        if (!bk.done) {
+          colorsMap.set(String(bk.value), col);
+        }
+
+        colorCount++;
+        if (colorCount % CHUNK === 0) {
+          const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+          if (opts.onStatus && now - lastUi2 > 80) {
+            lastUi2 = now;
+            if (total > 0) {
+              const p = Math.min(1, colorCount / total);
+              const pct = Math.max(0, Math.min(100, p * 100));
+              const pctText = pct < 1 ? pct.toFixed(2) : pct < 10 ? pct.toFixed(1) : String(Math.floor(pct));
+              opts.onStatus(`色を解析しています... ${pctText}% (${Math.min(colorCount, total).toLocaleString()}/${total.toLocaleString()})`);
+            } else {
+              opts.onStatus(`色を解析しています... ${colorCount.toLocaleString()}`);
+            }
+          }
+          await nextTick();
+        }
+      }
+    }
+  }
+
   // final status
   if (opts.onStatus) {
     if (total > 0) {
@@ -513,7 +609,7 @@ async function parseJsonProjectBody(
     }
   }
 
-  return { blocks, color, edges, version, kind };
+  return { blocks, colors: colorsMap, color, edges, version, kind };
 }
 
 async function parseQbuBodyToProjectFast(
@@ -572,7 +668,26 @@ type ProjectDataV4 = {
   mode?: string;
 };
 
-type ProjectData = ProjectDataV1 | ProjectDataV2 | ProjectDataV3 | ProjectDataV4;
+// v1.0.17+: project JSON format (save format A)
+type ProjectDataV5 = {
+  version: 5;
+  kind?: string;
+  blocks: string[];
+  /** save format A: blocks[] と同じ順序で色を並べる */
+  colors?: string[];
+  // optional UI state
+  edges?: boolean;
+  // legacy (読み込み互換)
+  color?: string;
+  // v4互換（将来：印刷スナップショットにも色を含める場合）
+  supportBlocks?: string[];
+  scaleSetting?: PrintScaleSetting;
+  mmPerUnit?: number;
+  maxSideMm?: number;
+  mode?: string;
+};
+
+type ProjectData = ProjectDataV1 | ProjectDataV2 | ProjectDataV3 | ProjectDataV4 | ProjectDataV5;
 
 function parseScaleSettingFromAny(obj: any): PrintScaleSetting | undefined {
   if (!obj || typeof obj !== "object") return undefined;
@@ -593,8 +708,14 @@ function parseProjectJSON(text: string): ProjectData | null {
     const obj = JSON.parse(text);
     if (!obj || typeof obj !== "object") return null;
 
-    // v1-v4 (project file)
-    if ((obj as any).version === 1 || (obj as any).version === 2 || (obj as any).version === 3 || (obj as any).version === 4) {
+    // v1-v5 (project file)
+    if (
+      (obj as any).version === 1 ||
+      (obj as any).version === 2 ||
+      (obj as any).version === 3 ||
+      (obj as any).version === 4 ||
+      (obj as any).version === 5
+    ) {
       if (!Array.isArray((obj as any).blocks)) return null;
       const blocks = (obj as any).blocks as string[];
 
@@ -605,6 +726,17 @@ function parseProjectJSON(text: string): ProjectData | null {
 
       if ((obj as any).version === 2) return { version: 2, blocks, color, edges };
       if ((obj as any).version === 3) return { version: 3, blocks, color, edges };
+
+      if ((obj as any).version === 5) {
+        const colors = Array.isArray((obj as any).colors) ? ((obj as any).colors as string[]) : undefined;
+        const kind = typeof (obj as any).kind === "string" ? (obj as any).kind : undefined;
+        const supportBlocks = Array.isArray((obj as any).supportBlocks) ? ((obj as any).supportBlocks as string[]) : undefined;
+        const scaleSetting = parseScaleSettingFromAny((obj as any).scaleSetting);
+        const mmPerUnit = Number.isFinite(Number((obj as any).mmPerUnit)) ? Number((obj as any).mmPerUnit) : undefined;
+        const maxSideMm = Number.isFinite(Number((obj as any).maxSideMm)) ? Number((obj as any).maxSideMm) : undefined;
+        const mode = typeof (obj as any).mode === "string" ? (obj as any).mode : undefined;
+        return { version: 5, kind, blocks, colors, edges, color, supportBlocks, scaleSetting, mmPerUnit, maxSideMm, mode };
+      }
 
       // v4: may include print supports and scale setting
       const supportBlocks = Array.isArray((obj as any).supportBlocks) ? ((obj as any).supportBlocks as string[]) : undefined;
@@ -639,8 +771,14 @@ function normalizeProjectObject(obj: any): ProjectData | null {
   try {
     if (!obj || typeof obj !== "object") return null;
 
-    // v1-v4 (project file)
-    if ((obj as any).version === 1 || (obj as any).version === 2 || (obj as any).version === 3 || (obj as any).version === 4) {
+    // v1-v5 (project file)
+    if (
+      (obj as any).version === 1 ||
+      (obj as any).version === 2 ||
+      (obj as any).version === 3 ||
+      (obj as any).version === 4 ||
+      (obj as any).version === 5
+    ) {
       if (!Array.isArray((obj as any).blocks)) return null;
       const blocks = (obj as any).blocks as string[];
 
@@ -651,6 +789,17 @@ function normalizeProjectObject(obj: any): ProjectData | null {
 
       if ((obj as any).version === 2) return { version: 2, blocks, color, edges };
       if ((obj as any).version === 3) return { version: 3, blocks, color, edges };
+
+      if ((obj as any).version === 5) {
+        const colors = Array.isArray((obj as any).colors) ? ((obj as any).colors as string[]) : undefined;
+        const kind = typeof (obj as any).kind === "string" ? (obj as any).kind : undefined;
+        const supportBlocks = Array.isArray((obj as any).supportBlocks) ? ((obj as any).supportBlocks as string[]) : undefined;
+        const scaleSetting = parseScaleSettingFromAny((obj as any).scaleSetting);
+        const mmPerUnit = Number.isFinite(Number((obj as any).mmPerUnit)) ? Number((obj as any).mmPerUnit) : undefined;
+        const maxSideMm = Number.isFinite(Number((obj as any).maxSideMm)) ? Number((obj as any).maxSideMm) : undefined;
+        const mode = typeof (obj as any).mode === "string" ? (obj as any).mode : undefined;
+        return { version: 5, kind, blocks, colors, edges, color, supportBlocks, scaleSetting, mmPerUnit, maxSideMm, mode };
+      }
 
       // v4: may include print supports and scale setting
       const supportBlocks = Array.isArray((obj as any).supportBlocks) ? ((obj as any).supportBlocks as string[]) : undefined;
@@ -745,8 +894,10 @@ function computeModelFingerprint(baseKeys: Iterable<string>, supportKeys: Iterab
 }
 
 export default function Builder() {
+  const router = useRouter();
   const { track, trackNow } = useTelemetry();
-  const { user, supabase } = useAuth();
+  const { user, supabase, loading: authLoading } = useAuth();
+  const { t } = useI18n();
 
   const requireLogin = (message: string) => {
     // AccountFab を開く
@@ -765,8 +916,17 @@ export default function Builder() {
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewDir, setPreviewDir] = useState<ViewDir>("front");
 
-  // 見た目（単色）
-  const [cubeColor, setCubeColor] = useState<string>(DEFAULT_CUBE_COLOR);
+  // 色（v1.0.17+: ブロック単位）
+  const ORIGIN_KEY = keyOf({ x: 0, y: 0, z: 0 });
+  const [blockColors, setBlockColors] = useState<Map<string, string>>(() => new Map([[ORIGIN_KEY, DEFAULT_BLOCK_COLOR]]));
+
+  // ペイントで選択中の色（UI上のカレントカラー）
+  // - 造形で追加するブロックの初期色にも使われます
+  const [paintColor, setPaintColor] = useState<string>(DEFAULT_BLOCK_COLOR);
+
+  // エディタのモード: 造形 / ペイント
+  const [editorMode, setEditorMode] = useState<"model" | "paint">("model");
+
   const [showEdges, setShowEdges] = useState<boolean>(true);
 
   // 3面図（参照画像）
@@ -784,6 +944,41 @@ export default function Builder() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+
+// UI: 他ページ（CodingMode など）から戻るときにモードを指定できる
+const UI_MODE_KEY = "qbu_ui_mode_v1";
+useEffect(() => {
+  try {
+    const v = localStorage.getItem(UI_MODE_KEY);
+    if (v === "model" || v === "paint") {
+      setEditorMode(v);
+    }
+    if (v) localStorage.removeItem(UI_MODE_KEY);
+  } catch {
+    // ignore
+  }
+}, []);
+
+// UI: Gallery で選択したプロジェクトを開く
+useEffect(() => {
+  if (authLoading) return;
+  if (!supabase) return;
+  try {
+    const id = localStorage.getItem(OPEN_MODEL_KEY);
+    if (!id) return;
+    const asCopy = localStorage.getItem(OPEN_MODEL_COPY_KEY) === "1";
+    localStorage.removeItem(OPEN_MODEL_KEY);
+    localStorage.removeItem(OPEN_MODEL_COPY_KEY);
+    // 開く処理は非同期（重い）なので、次tickに回して初期描画を優先
+    window.setTimeout(() => {
+      openModelFromGallery(id, { asCopy });
+    }, 0);
+  } catch {
+    // ignore
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [authLoading, supabase, user?.id]);
+
   // 初回：保存済みがあれば復元（ドラフト優先）
   useEffect(() => {
     try {
@@ -794,14 +989,30 @@ export default function Builder() {
 
       const next = new Set<string>();
       for (const k of parsed.blocks) next.add(k);
-      if (next.size === 0) next.add(keyOf({ x: 0, y: 0, z: 0 }));
+      if (next.size === 0) next.add(ORIGIN_KEY);
       setBlocks(next);
 
-      // v2+：色・エッジ
-      if (parsed.version >= 2) {
-        if (typeof (parsed as any).color === "string") setCubeColor((parsed as any).color);
-        if (typeof (parsed as any).edges === "boolean") setShowEdges((parsed as any).edges);
+      // edges
+      if (typeof (parsed as any).edges === "boolean") setShowEdges((parsed as any).edges);
+
+      // colors (v5 format A) or legacy single color
+      const colorsMap = new Map<string, string>();
+      const legacy = typeof (parsed as any).color === "string" ? (parsed as any).color : DEFAULT_BLOCK_COLOR;
+      const colorsArr: unknown[] | null = Array.isArray((parsed as any).colors) ? ((parsed as any).colors as unknown[]) : null;
+
+      if (colorsArr) {
+        for (let i = 0; i < parsed.blocks.length; i++) {
+          const k = parsed.blocks[i];
+          if (typeof k !== "string") continue;
+          const c = colorsArr[i];
+          colorsMap.set(k, typeof c === "string" ? c : legacy);
+        }
+      } else {
+        for (const k of next) colorsMap.set(k, legacy);
       }
+
+      if (colorsMap.size === 0) colorsMap.set(ORIGIN_KEY, DEFAULT_BLOCK_COLOR);
+      setBlockColors(colorsMap);
     } catch {
       // ignore
     }
@@ -810,13 +1021,20 @@ export default function Builder() {
   // 編集中の状態は自動でドラフト保存（ログインでリロードされても消えない）
   useEffect(() => {
     const t = window.setTimeout(() => {
-      const data: any = {
-        version: 2,
-        blocks: Array.from(blocks),
-        color: cubeColor,
+      // Huge draft snapshots can freeze the tab. Keep it bounded.
+      const MAX_DRAFT = 20_000;
+      if (blocks.size > MAX_DRAFT) return;
+
+      const base = Array.from(blocks);
+      const colors = base.map((k) => blockColors.get(k) || DEFAULT_BLOCK_COLOR);
+      const data: ProjectDataV5 = {
+        version: 5,
+        kind: "project",
+        blocks: base,
+        colors,
         edges: showEdges,
         updated_at: Date.now(),
-      };
+      } as any;
       try {
         localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
       } catch {
@@ -824,11 +1042,16 @@ export default function Builder() {
       }
     }, 320);
     return () => window.clearTimeout(t);
-  }, [blocks, cubeColor, showEdges]);
+  }, [blocks, blockColors, showEdges]);
 
   const clearAll = () => {
     track("project_reset", { before: blocks.size });
-    setBlocks(new Set([keyOf({ x: 0, y: 0, z: 0 })]));
+    setBlocks(new Set([ORIGIN_KEY]));
+    setBlockColors(new Map([[ORIGIN_KEY, DEFAULT_BLOCK_COLOR]]));
+
+    // UIも初期状態へ
+    setPaintColor(DEFAULT_BLOCK_COLOR);
+    setEditorMode("model");
 
     // 重要: リセット後は「新しいプロジェクト」として扱う。
     // 既存モデル編集中のままだと誤って上書き保存してしまうため、紐づけを解除する。
@@ -854,10 +1077,39 @@ useEffect(() => {
   return () => window.clearTimeout(t);
 }, [toast]);
 
-  // MyQ-BUModels (cloud gallery)
-  const [modelsOpen, setModelsOpen] = useState(false);
+  // Gallery (cloud)
   const [currentModelId, setCurrentModelId] = useState<string | null>(null);
   const [currentModelName, setCurrentModelName] = useState<string | null>(null);
+
+  // Header project name (editable)
+  const [nameEditing, setNameEditing] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+
+  // Restore current model info across page transitions (/coding, /gallery)
+  useEffect(() => {
+    try {
+      const id = localStorage.getItem(CURRENT_MODEL_ID_KEY);
+      const name = localStorage.getItem(CURRENT_MODEL_NAME_KEY);
+      if (id) setCurrentModelId(id);
+      if (name) setCurrentModelName(name);
+    } catch {
+      // ignore
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist current model info
+  useEffect(() => {
+    try {
+      if (currentModelId) localStorage.setItem(CURRENT_MODEL_ID_KEY, currentModelId);
+      else localStorage.removeItem(CURRENT_MODEL_ID_KEY);
+
+      if (currentModelName) localStorage.setItem(CURRENT_MODEL_NAME_KEY, currentModelName);
+      else localStorage.removeItem(CURRENT_MODEL_NAME_KEY);
+    } catch {
+      // ignore
+    }
+  }, [currentModelId, currentModelName]);
 
   // 印刷用補完
   const [prepOpen, setPrepOpen] = useState(false);
@@ -893,25 +1145,11 @@ useEffect(() => {
       } catch {
         // ignore
       }
-      requireLogin("保存するにはログインが必要です。（ログイン後に保存画面が開きます）");
+      requireLogin(t("account.loginRequired"));
       return;
     }
     setSaveOpen(true);
     track("save_modal_open");
-  };
-
-  const openModelsFlow = () => {
-    track("my_models_open_click", { logged_in: Boolean(user) });
-    if (!user) {
-      requireLogin("MyQ-BUModels を開くにはログインが必要です。");
-      return;
-    }
-    if (!supabase) {
-      window.alert("クラウド保存が未設定です（Supabase環境変数を確認してください）。");
-      return;
-    }
-    setModelsOpen(true);
-    track("my_models_open");
   };
 
   const saveProject = async (
@@ -922,7 +1160,7 @@ useEffect(() => {
     }
   ): Promise<boolean> => {
     if (!user) {
-      requireLogin("保存するにはログインが必要です。");
+      requireLogin(t("account.loginRequired"));
       return false;
     }
     if (!supabase) {
@@ -939,8 +1177,8 @@ useEffect(() => {
       track("project_save", {
         blocks: blocks.size,
         max_dim: bbox.maxDim,
-        color: cubeColor,
         edges: showEdges,
+        colors: "per_block",
         has_current_model: Boolean(currentModelId),
         as_new: Boolean(opts?.asNew),
         download_local: Boolean(opts?.downloadLocal),
@@ -949,17 +1187,19 @@ useEffect(() => {
       setSaveStatus("ブロックを集計しています...");
       await nextTick();
       const base = Array.from(blocks);
+      const colors = base.map((k) => blockColors.get(k) || DEFAULT_BLOCK_COLOR);
 
       // Local restore snapshot (同じ端末では復元できる)
       // 大きいモデルで localStorage JSON を作ると固まりやすいため、一定数以上はスキップします。
       const MAX_LOCAL_BACKUP_BLOCKS = 20000;
       if (base.length <= MAX_LOCAL_BACKUP_BLOCKS) {
-        const restoreData: ProjectDataV2 = {
-          version: 2,
+        const restoreData: ProjectDataV5 = {
+          version: 5,
+          kind: "project",
           blocks: base,
-          color: cubeColor,
+          colors,
           edges: showEdges,
-        };
+        } as any;
         window.setTimeout(() => {
           try {
             localStorage.setItem(STORAGE_KEY, JSON.stringify(restoreData));
@@ -975,19 +1215,19 @@ useEffect(() => {
       }
 
       // Cloud payload (.qbu)
-      const payload: ProjectDataV4 = {
-        version: 4,
+      const payload: ProjectDataV5 = {
+        version: 5,
         kind: "project",
         blocks: base,
-        color: cubeColor,
+        colors,
         edges: showEdges,
-      };
+      } as any;
 
       // 1) Encode (.qbu)
       // v1.0.16 以降はパスワード付き書き出しを廃止し、常に非暗号化でパッケージ化します。
       // 大きいモデルではパッケージ化に時間がかかるため、進捗（% と 件数）を表示します。
       const totalBlocks = base.length;
-      setSaveStatus(`パッケージ化しています... 0% (0/${totalBlocks.toLocaleString()})`);
+      setSaveStatus(`パッケージ化（blocks）... 0% (0/${totalBlocks.toLocaleString()})`);
       await nextTick();
 
       let lastUiUpdate = 0;
@@ -1000,11 +1240,14 @@ useEffect(() => {
           if (now - lastUiUpdate < 150) return;
           lastUiUpdate = now;
 
-          const pct = Math.max(0, Math.min(100, p * 100));
+          // v1.0.17+: buildJsonBody で blocks/colors を 2フェーズで進捗通知
+          const stage = p < 0.5 ? "blocks" : "colors";
+          const stageP = p < 0.5 ? p / 0.5 : (p - 0.5) / 0.5;
+          const pct = Math.max(0, Math.min(100, stageP * 100));
           const pctText = pct < 1 ? pct.toFixed(2) : pct < 10 ? pct.toFixed(1) : String(Math.floor(pct));
-          const done = Math.max(0, Math.min(totalBlocks, Math.floor(p * totalBlocks)));
+          const done = Math.max(0, Math.min(totalBlocks, Math.floor(stageP * totalBlocks)));
 
-          setSaveStatus(`パッケージ化しています... ${pctText}% (${done.toLocaleString()}/${totalBlocks.toLocaleString()})`);
+          setSaveStatus(`パッケージ化（${stage}）... ${pctText}% (${done.toLocaleString()}/${totalBlocks.toLocaleString()})`);
         },
       });
 
@@ -1016,7 +1259,11 @@ useEffect(() => {
       setSaveStatus("サムネイルを生成しています...");
       await nextTick();
       const thumbBlocks = sampleSetForThumb(blocks, 12000);
-      const thumb_data_url = generateThumbDataUrl(thumbBlocks, cubeColor, { size: 160 });
+      const thumb_data_url = generateThumbDataUrl(thumbBlocks, {
+        size: 160,
+        colorsByKey: blockColors,
+        defaultColor: DEFAULT_BLOCK_COLOR,
+      });
 
       setSaveStatus("モデル情報を計算しています...");
       await nextTick();
@@ -1112,20 +1359,84 @@ const showToast = (msg: string) => {
   }
 };
 
-const buildBlocksSetChunked = async (arr: string[]) => {
-  const total = Math.max(0, arr?.length || 0);
+const beginNameEdit = () => {
+  setNameDraft((currentModelName || "Q-BU").slice(0, 120));
+  setNameEditing(true);
+  track("project_name_edit_begin", { has_current_model: Boolean(currentModelId) });
+};
+
+const commitNameEdit = async () => {
+  const nextRaw = String(nameDraft || "");
+  const next = nextRaw.trim().replace(/\s+/g, " ").slice(0, 120);
+  setNameEditing(false);
+  if (!next) return;
+  if (next === (currentModelName || "")) return;
+
+  const prev = currentModelName;
+  setCurrentModelName(next);
+  track("project_name_edit_commit", {
+    has_current_model: Boolean(currentModelId),
+    logged_in: Boolean(user),
+  });
+
+  // Unsaved/new project: local rename only
+  if (!currentModelId) {
+    showToast(t("toast.renamed", { name: next }));
+    return;
+  }
+
+  if (!supabase) {
+    showToast("Supabase 未設定のため、クラウドへ反映できません");
+    return;
+  }
+
+  if (!user) {
+    requireLogin(t("account.loginRequired"));
+    showToast(t("toast.loginToSyncName"));
+    return;
+  }
+
+  try {
+    const res = await supabase
+      .from("user_models")
+      .update({ name: next, updated_at: new Date().toISOString() })
+      .eq("id", currentModelId);
+    if (res.error) throw new Error(res.error.message);
+    showToast(t("toast.renamed", { name: next }));
+  } catch (e: any) {
+    // revert on error
+    setCurrentModelName(prev);
+    showToast(t("toast.renameFailed", { msg: e?.message || String(e) }));
+  }
+};
+
+const buildBlocksAndColorsChunked = async (
+  blocksArr: string[],
+  colorsArr?: string[] | undefined,
+  fallbackColor?: string
+): Promise<{ blocks: Set<string>; colors: Map<string, string> }> => {
+  const total = Math.max(0, blocksArr?.length || 0);
   const next = new Set<string>();
+  const colors = new Map<string, string>();
+  const fallback = fallbackColor || DEFAULT_BLOCK_COLOR;
+
   if (total === 0) {
-    next.add(keyOf({ x: 0, y: 0, z: 0 }));
-    return next;
+    const origin = keyOf({ x: 0, y: 0, z: 0 });
+    next.add(origin);
+    colors.set(origin, DEFAULT_BLOCK_COLOR);
+    return { blocks: next, colors };
   }
 
   const CHUNK = 5000;
   let lastUiUpdate = 0;
 
   for (let i = 0; i < total; i++) {
-    const k = arr[i];
-    if (typeof k === "string") next.add(k);
+    const k = blocksArr[i];
+    if (typeof k === "string") {
+      next.add(k);
+      const c = colorsArr && typeof colorsArr[i] === "string" ? (colorsArr[i] as string) : fallback;
+      colors.set(k, c);
+    }
 
     if ((i + 1) % CHUNK === 0 || i === total - 1) {
       const now = typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -1134,14 +1445,18 @@ const buildBlocksSetChunked = async (arr: string[]) => {
         const p = (i + 1) / total;
         const pct = Math.max(0, Math.min(100, p * 100));
         const pctText = pct < 1 ? pct.toFixed(2) : pct < 10 ? pct.toFixed(1) : String(Math.floor(pct));
-        setLoadStatus(`ブロックを展開しています... ${pctText}% (${(i + 1).toLocaleString()}/${total.toLocaleString()})`);
+        setLoadStatus(`ブロック/色を展開しています... ${pctText}% (${(i + 1).toLocaleString()}/${total.toLocaleString()})`);
       }
       await nextTick();
     }
   }
 
-  if (next.size === 0) next.add(keyOf({ x: 0, y: 0, z: 0 }));
-  return next;
+  if (next.size === 0) {
+    const origin = keyOf({ x: 0, y: 0, z: 0 });
+    next.add(origin);
+    colors.set(origin, DEFAULT_BLOCK_COLOR);
+  }
+  return { blocks: next, colors };
 };
 
 const applyLoadedProject = async (data: ProjectData, opts: { name: string | null; modelId: string | null }) => {
@@ -1149,26 +1464,29 @@ const applyLoadedProject = async (data: ProjectData, opts: { name: string | null
   setLoadStatus("読み込み中...");
 
   try {
-    const next = await buildBlocksSetChunked(data.blocks || []);
-    setBlocks(next);
+    const legacy = typeof (data as any).color === "string" ? (data as any).color : DEFAULT_BLOCK_COLOR;
+    const colorsArr = Array.isArray((data as any).colors) ? ((data as any).colors as string[]) : undefined;
+    const built = await buildBlocksAndColorsChunked(data.blocks || [], colorsArr, legacy);
+    setBlocks(built.blocks);
+    setBlockColors(built.colors);
 
-    const loadedColor = typeof (data as any).color === "string" ? (data as any).color : cubeColor;
     const loadedEdges = typeof (data as any).edges === "boolean" ? (data as any).edges : showEdges;
-    setCubeColor(loadedColor);
     setShowEdges(loadedEdges);
 
     setCurrentModelId(opts.modelId);
     setCurrentModelName(opts.name);
 
     // Local restore snapshot (avoid huge synchronous JSON.stringify)
-    const baseArr = Array.from(next);
+    const baseArr = Array.from(built.blocks);
     if (baseArr.length <= MAX_LOCAL_BACKUP_BLOCKS) {
-      const restoreData: ProjectDataV2 = {
-        version: 2,
+      const restoreColors = baseArr.map((k) => built.colors.get(k) || DEFAULT_BLOCK_COLOR);
+      const restoreData: ProjectDataV5 = {
+        version: 5,
+        kind: "project",
         blocks: baseArr,
-        color: loadedColor,
+        colors: restoreColors,
         edges: loadedEdges,
-      };
+      } as any;
       window.setTimeout(() => {
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(restoreData));
@@ -1188,17 +1506,14 @@ const applyLoadedProject = async (data: ProjectData, opts: { name: string | null
   }
 };
 
-const openModelFromGallery = async (id: string) => {
-  if (!user) {
-    requireLogin("MyQ-BUModels を開くにはログインが必要です。");
-    return;
-  }
+const openModelFromGallery = async (id: string, opts?: { asCopy?: boolean }) => {
   if (!supabase) {
     window.alert("クラウド保存が未設定です（Supabase環境変数を確認してください）。");
     return;
   }
 
-  track("my_models_open_select", { id });
+  const asCopy = Boolean(opts?.asCopy);
+  track("gallery_open_select", { id, as_copy: asCopy, logged_in: Boolean(user) });
 
   setLoadBusy(true);
   setLoadStatus("クラウドから取得しています...");
@@ -1210,7 +1525,12 @@ const openModelFromGallery = async (id: string) => {
       .eq("id", id)
       .single();
     if (res.error || !res.data) {
-      window.alert(`読み込みに失敗しました: ${res.error?.message || "not_found"}`);
+      // MyProjects はログイン必須。PublicProjects は anon でも読める（RLS次第）。
+      if (!user) {
+        requireLogin(t("account.loginRequired"));
+      } else {
+        window.alert(`読み込みに失敗しました: ${res.error?.message || "not_found"}`);
+      }
       return;
     }
 
@@ -1262,23 +1582,35 @@ const openModelFromGallery = async (id: string) => {
     const nextSet = parsed.blocks;
     setBlocks(nextSet);
 
-    const loadedColor = typeof parsed.color === "string" ? parsed.color : cubeColor;
+    // colors
+    let nextColors: Map<string, string>;
+    if (parsed.colors && parsed.colors instanceof Map && parsed.colors.size > 0) {
+      nextColors = parsed.colors;
+    } else {
+      const legacy = typeof parsed.color === "string" ? parsed.color : DEFAULT_BLOCK_COLOR;
+      nextColors = new Map<string, string>();
+      for (const k of nextSet) nextColors.set(k, legacy);
+    }
+    if (nextColors.size === 0) nextColors.set(keyOf({ x: 0, y: 0, z: 0 }), DEFAULT_BLOCK_COLOR);
+    setBlockColors(nextColors);
+
     const loadedEdges = typeof parsed.edges === "boolean" ? parsed.edges : showEdges;
-    setCubeColor(loadedColor);
     setShowEdges(loadedEdges);
 
-    setCurrentModelId(id);
-    setCurrentModelName(name);
+    setCurrentModelId(asCopy ? null : id);
+    setCurrentModelName(asCopy ? `${name}（copy）` : name);
 
     // Local restore snapshot (avoid huge synchronous JSON.stringify)
     if (nextSet.size <= MAX_LOCAL_BACKUP_BLOCKS) {
       const baseArr = Array.from(nextSet);
-      const restoreData: ProjectDataV2 = {
-        version: 2,
+      const restoreColors = baseArr.map((k) => nextColors.get(k) || DEFAULT_BLOCK_COLOR);
+      const restoreData: ProjectDataV5 = {
+        version: 5,
+        kind: "project",
         blocks: baseArr,
-        color: loadedColor,
+        colors: restoreColors,
         edges: loadedEdges,
-      };
+      } as any;
       window.setTimeout(() => {
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(restoreData));
@@ -1293,13 +1625,14 @@ const openModelFromGallery = async (id: string) => {
       }, 0);
     }
 
-    track("my_models_open_loaded", {
+    track("gallery_open_loaded", {
       id,
+      as_copy: asCopy,
       blocks: nextSet.size,
       qbu_encrypted: unpacked.encrypted,
       qbu_compressed: unpacked.compressed,
     });
-    showToast(`読み込みました: ${name}`);
+    showToast(asCopy ? `読み込みました（コピー）: ${name}` : `読み込みました: ${name}`);
   } catch (e: any) {
     console.error(e);
     window.alert(`読み込みに失敗しました: ${e?.message || e}`);
@@ -1317,10 +1650,10 @@ const openModelFromGallery = async (id: string) => {
     supportKeys: Set<SubKey>,
     exportKind: "direct" | "print_prep" = "direct"
   ) => {
-    if (!user) {
-      requireLogin("保存するにはログインが必要です。");
-      return;
-    }
+      if (!user) {
+        requireLogin(t("account.loginRequired"));
+        return;
+      }
 
     const bboxNow = computeMixedBBox(baseKeys, supportKeys);
     const resolved = resolvePrintScale({
@@ -1396,7 +1729,7 @@ const openModelFromGallery = async (id: string) => {
 
   const exportStlDirect = (baseName: string, scaleSetting: PrintScaleSetting) => {
     if (!user) {
-      requireLogin("保存するにはログインが必要です。");
+      requireLogin(t("account.loginRequired"));
       return;
     }
 
@@ -1522,20 +1855,32 @@ const handleDroppedFile = async (file: File) => {
       const nextSet = parsed.blocks;
       setBlocks(nextSet);
 
-      const loadedColor = typeof parsed.color === "string" ? parsed.color : cubeColor;
+      // colors
+      let nextColors: Map<string, string>;
+      if (parsed.colors && parsed.colors instanceof Map && parsed.colors.size > 0) {
+        nextColors = parsed.colors;
+      } else {
+        const legacy = typeof parsed.color === "string" ? parsed.color : DEFAULT_BLOCK_COLOR;
+        nextColors = new Map<string, string>();
+        for (const k of nextSet) nextColors.set(k, legacy);
+      }
+      if (nextColors.size === 0) nextColors.set(keyOf({ x: 0, y: 0, z: 0 }), DEFAULT_BLOCK_COLOR);
+      setBlockColors(nextColors);
+
       const loadedEdges = typeof parsed.edges === "boolean" ? parsed.edges : showEdges;
-      setCubeColor(loadedColor);
       setShowEdges(loadedEdges);
 
       // Local restore snapshot (avoid huge synchronous JSON.stringify)
       if (nextSet.size <= MAX_LOCAL_BACKUP_BLOCKS) {
         const baseArr = Array.from(nextSet);
-        const restoreData: ProjectDataV2 = {
-          version: 2,
+        const restoreColors = baseArr.map((k) => nextColors.get(k) || DEFAULT_BLOCK_COLOR);
+        const restoreData: ProjectDataV5 = {
+          version: 5,
+          kind: "project",
           blocks: baseArr,
-          color: loadedColor,
+          colors: restoreColors,
           edges: loadedEdges,
-        };
+        } as any;
         window.setTimeout(() => {
           try {
             localStorage.setItem(STORAGE_KEY, JSON.stringify(restoreData));
@@ -1655,13 +2000,107 @@ const handleDroppedFile = async (file: File) => {
   return (
     <div className="page">
       <header className="topHeader minimal">
-        <div className="title">Q-BU!{currentModelName ? <span style={{ marginLeft: 10, fontSize: 12, fontWeight: 900, opacity: 0.75 }}>（編集中: {currentModelName}）</span> : null}</div>
+        <div className="headerLeft">
+          <div className="title">
+            Q-BU{" "}
+            <span className="modeSelectWrap" aria-label="Mode">
+              <select
+                className="modeSelect"
+                value={editorMode}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "coding") {
+                    // CodingMode へ遷移（別ページ）
+                    // - 遷移直前にドラフトを同期保存して、/coding 側で最新状態を読み込めるようにする
+                    try {
+                      const base = Array.from(blocks);
+                      const colors = base.map((k) => blockColors.get(k) || DEFAULT_BLOCK_COLOR);
+                      const data: ProjectDataV5 = {
+                        version: 5,
+                        kind: "project",
+                        blocks: base,
+                        colors,
+                        edges: showEdges,
+                        updated_at: Date.now(),
+                      } as any;
+                      localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
+                    } catch {
+                      // ignore
+                    }
+
+                    try {
+                      localStorage.setItem(UI_MODE_KEY, editorMode);
+                    } catch {
+                      // ignore
+                    }
+
+                    track("coding_open");
+                    router.push("/coding");
+                    return;
+                  }
+
+                  if (v === "gallery") {
+                    try {
+                      localStorage.setItem(UI_MODE_KEY, editorMode);
+                    } catch {
+                      // ignore
+                    }
+                    track("gallery_open");
+                    router.push("/gallery");
+                    return;
+                  }
+
+                  const next = v === "paint" ? "paint" : "model";
+                  setEditorMode(next);
+                  track("editor_mode", { mode: next, by: "dropdown" });
+                }}
+              >
+                <option value="model">{t("mode.model")}</option>
+                <option value="paint">{t("mode.paint")}</option>
+                <option value="coding">{t("mode.coding")}</option>
+                <option value="gallery">{t("mode.gallery")}</option>
+              </select>
+            </span>
+          </div>
+        </div>
+
+        <div className="headerCenter">
+          {nameEditing ? (
+            <input
+              className="projectNameInput"
+              value={nameDraft}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onBlur={() => void commitNameEdit()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void commitNameEdit();
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setNameDraft(currentModelName || "Q-BU");
+                  setNameEditing(false);
+                }
+              }}
+              autoFocus
+              aria-label={t("header.project.rename")}
+            />
+          ) : (
+            <button
+              type="button"
+              className="projectNameBtn"
+              onClick={beginNameEdit}
+              title={t("header.project.rename")}
+              aria-label={t("header.project.rename")}
+            >
+              {currentModelName || "Q-BU"}
+            </button>
+          )}
+        </div>
+
         <div className="headerRight">
-          <button type="button" className="hbtn" onClick={openModelsFlow}>
-            MyQ-BUModels
-          </button>
           <button type="button" className="hbtn" onClick={openSaveFlow}>
-            保存する
+            {t("header.save")}
           </button>
         </div>
       </header>
@@ -1672,6 +2111,7 @@ const handleDroppedFile = async (file: File) => {
             <div className="previewPane">
               <VoxelPreview
                 blocks={blocks}
+                blockColors={blockColors}
                 bbox={bbox}
                 dir={previewDir}
                 onDirChange={(d) => {
@@ -1682,7 +2122,6 @@ const handleDroppedFile = async (file: File) => {
                   setPreviewOpen(false);
                   track("preview_close");
                 }}
-                cubeColor={cubeColor}
                 showEdges={showEdges}
                 onImportThreeView={handleImportThreeView}
                 hasRefs={hasRefs}
@@ -1698,6 +2137,12 @@ const handleDroppedFile = async (file: File) => {
             <VoxelEditor
               blocks={blocks}
               setBlocks={setBlocks}
+              blockColors={blockColors}
+              setBlockColors={setBlockColors}
+              editorMode={editorMode}
+              setEditorMode={setEditorMode}
+              paintColor={paintColor}
+              setPaintColor={setPaintColor}
               yawIndex={yawIndex}
               pitchIndex={pitchIndex}
               setYawIndex={setYawIndex}
@@ -1709,8 +2154,6 @@ const handleDroppedFile = async (file: File) => {
               }}
               cubeCount={cubeCount}
               onClearAll={clearAll}
-              cubeColor={cubeColor}
-              setCubeColor={setCubeColor}
               showEdges={showEdges}
               setShowEdges={setShowEdges}
               refImages={refImages}
@@ -1720,25 +2163,6 @@ const handleDroppedFile = async (file: File) => {
           </div>
         </div>
       </main>
-
-      <MyModelsModal
-        open={modelsOpen}
-        onClose={() => {
-          setModelsOpen(false);
-          track("my_models_close");
-        }}
-        supabase={supabase}
-        currentModelId={currentModelId}
-        onDeletedCurrent={() => {
-          setCurrentModelId(null);
-          setCurrentModelName(null);
-        }}
-        onOpenModel={async (id) => {
-          setModelsOpen(false);
-          track("my_models_close_after_open");
-          await openModelFromGallery(id);
-        }}
-      />
 
       <SaveModal
         open={saveOpen}
@@ -1758,8 +2182,8 @@ const handleDroppedFile = async (file: File) => {
           const ok = await saveProject(name, opts);
           if (ok) {
             setSaveOpen(false);
-            setModelsOpen(true);
-            track("my_models_open_after_save");
+            track("gallery_open_after_save");
+            router.push("/gallery");
           }
         }}
         onExportStl={(name, setting) => {
@@ -1768,7 +2192,7 @@ const handleDroppedFile = async (file: File) => {
         }}
         onOpenPrintPrep={(name, setting) => {
           if (!user) {
-            requireLogin("保存するにはログインが必要です。");
+        requireLogin(t("account.loginRequired"));
             return;
           }
           track("print_prep_open", {

@@ -201,8 +201,15 @@ async function buildJsonBody(
   const blocksRaw = payload && typeof payload === "object" ? (payload as any).blocks : null;
   const blocks = isStringArray(blocksRaw) ? blocksRaw : null;
 
+  // v1.0.17+: per-block colors (save format A)
+  const colorsRaw = payload && typeof payload === "object" ? (payload as any).colors : null;
+  const colors = isStringArray(colorsRaw) ? colorsRaw : null;
+
   // Small payloads: keep it simple and fast.
   const STREAM_THRESHOLD = 500;
+
+  // Stream when blocks are big.
+  // (colors は blocks と同サイズになるため、blocks が大きければ colors も大きい想定)
   if (!blocks || blocks.length < STREAM_THRESHOLD) {
     const jsonBytes = new TextEncoder().encode(JSON.stringify(payload));
     if (!opts.compress) return { body: jsonBytes, compressed: false };
@@ -216,9 +223,11 @@ async function buildJsonBody(
   const total = blocks.length;
   const onProgress = opts.onProgress;
 
-  // Split payload into "rest" + blocks array to stream only the heavy part.
+  // Split payload into "rest" + blocks/colors arrays to stream only the heavy part.
   const rest: any = { ...(payload as any) };
   delete rest.blocks;
+  // NOTE: colors が大きいと head の JSON.stringify(rest) が固まるため、blocks をストリームする場合は colors も外に出す
+  if (colors) delete rest.colors;
 
   let head = JSON.stringify(rest);
   if (head.endsWith("}")) {
@@ -226,10 +235,12 @@ async function buildJsonBody(
   } else {
     head = '{"blocks":[';
   }
-  const tail = "]}";
+  const mid = colors ? '],"colors":[' : null;
+  const tail = colors ? "]}" : "]}";
 
   const enc = new TextEncoder();
   const CHUNK_BLOCKS = 2000;
+  const CHUNK_COLORS = 4000;
 
   // If gzip is requested and supported, stream into CompressionStream.
   if (opts.compress && typeof (globalThis as any).CompressionStream !== "undefined") {
@@ -244,6 +255,7 @@ async function buildJsonBody(
 
       let lastYield = typeof performance !== "undefined" ? performance.now() : Date.now();
 
+      // blocks
       for (let i = 0; i < total; i += CHUNK_BLOCKS) {
         const end = Math.min(i + CHUNK_BLOCKS, total);
 
@@ -255,12 +267,45 @@ async function buildJsonBody(
 
         await writeWithTimeout(writer, enc.encode(chunkStr), 8000);
 
-        if (onProgress) onProgress(end / total);
+        if (onProgress) {
+          // if colors exist, progress is split into 2 phases
+          if (colors) onProgress(0.5 * (end / total));
+          else onProgress(end / total);
+        }
 
         const now = typeof performance !== "undefined" ? performance.now() : Date.now();
         if (now - lastYield > 16) {
           lastYield = now;
           await yieldToEventLoop();
+        }
+      }
+
+      // colors (optional)
+      if (colors && mid) {
+        await writeWithTimeout(writer, enc.encode(mid), 8000);
+
+        const totalC = colors.length;
+        for (let i = 0; i < totalC; i += CHUNK_COLORS) {
+          const end = Math.min(i + CHUNK_COLORS, totalC);
+
+          const parts: string[] = [];
+          for (let j = i; j < end; j++) parts.push(JSON.stringify(colors[j]));
+
+          let chunkStr = parts.join(",");
+          if (i > 0) chunkStr = "," + chunkStr;
+
+          await writeWithTimeout(writer, enc.encode(chunkStr), 8000);
+
+          if (onProgress) {
+            // 2nd phase
+            onProgress(0.5 + 0.5 * (end / Math.max(1, totalC)));
+          }
+
+          const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+          if (now - lastYield > 16) {
+            lastYield = now;
+            await yieldToEventLoop();
+          }
         }
       }
 
@@ -284,6 +329,7 @@ async function buildJsonBody(
 
   let lastYield = typeof performance !== "undefined" ? performance.now() : Date.now();
 
+  // blocks
   for (let i = 0; i < total; i += CHUNK_BLOCKS) {
     const end = Math.min(i + CHUNK_BLOCKS, total);
 
@@ -295,12 +341,43 @@ async function buildJsonBody(
 
     chunks.push(enc.encode(chunkStr));
 
-    if (onProgress) onProgress(end / total);
+    if (onProgress) {
+      if (colors) onProgress(0.5 * (end / total));
+      else onProgress(end / total);
+    }
 
     const now = typeof performance !== "undefined" ? performance.now() : Date.now();
     if (now - lastYield > 16) {
       lastYield = now;
       await yieldToEventLoop();
+    }
+  }
+
+  // colors (optional)
+  if (colors && mid) {
+    chunks.push(enc.encode(mid));
+
+    const totalC = colors.length;
+    for (let i = 0; i < totalC; i += CHUNK_COLORS) {
+      const end = Math.min(i + CHUNK_COLORS, totalC);
+
+      const parts: string[] = [];
+      for (let j = i; j < end; j++) parts.push(JSON.stringify(colors[j]));
+
+      let chunkStr = parts.join(",");
+      if (i > 0) chunkStr = "," + chunkStr;
+
+      chunks.push(enc.encode(chunkStr));
+
+      if (onProgress) {
+        onProgress(0.5 + 0.5 * (end / Math.max(1, totalC)));
+      }
+
+      const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+      if (now - lastYield > 16) {
+        lastYield = now;
+        await yieldToEventLoop();
+      }
     }
   }
 

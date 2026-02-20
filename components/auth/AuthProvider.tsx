@@ -1,6 +1,7 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { useI18n } from "@/components/i18n/I18nProvider";
 import type { Session, SupabaseClient, User } from "@supabase/supabase-js";
 
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -55,6 +56,7 @@ function isProbablyEmbeddedWebView(): boolean {
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const { t } = useI18n();
   const supabase = useMemo(() => getSupabaseBrowserClient(), []);
 
   const [loading, setLoading] = useState(true);
@@ -112,7 +114,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signInWithGoogle = async () => {
     if (!supabase) {
-      alert("ログイン機能が未設定です。管理者に連絡してください。");
+      alert(t("auth.notConfigured"));
       return;
     }
 
@@ -145,7 +147,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } catch {
         // ignore
       }
-      alert("Googleログインに失敗しました。設定を確認してください。");
+      alert(t("auth.googleFailed"));
       return;
     }
 

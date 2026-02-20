@@ -36,3 +36,27 @@ cp .env.local.example .env.local
 - 画面左下の丸いボタンからログインできます。
   - 保存・エクスポートにはログインが必要です。
 - 同意後、ログインの有無に関係なく `event_logs` にイベントが保存されます。
+
+## Build gotchas (TypeScript / Next.js)
+
+### Blob + Uint8Array<ArrayBufferLike> error
+
+You may see a build error like:
+
+- `Type 'Uint8Array<ArrayBufferLike>' is not assignable to type 'BlobPart'`
+- `SharedArrayBuffer is not assignable to ArrayBuffer`
+
+This happens when a `Uint8Array` originates from Node `Buffer` (or other sources) whose underlying `.buffer` can be a `SharedArrayBuffer`, which TypeScript treats as `ArrayBufferLike`.
+
+**Fix:** copy into a plain `ArrayBuffer`-backed `Uint8Array` before passing to `Blob`:
+
+```ts
+const buf = Buffer.from(b64, "base64"); // Uint8Array<ArrayBufferLike>
+const copy = new Uint8Array(buf.byteLength);
+copy.set(buf);
+const blob = new Blob([copy], { type: "application/octet-stream" });
+```
+
+We do this in `components/qbu/myModelsUtils.ts: base64ToBytes()` so callers can safely do `new Blob([bytes])`.
+
+**Regression check:** search for direct `Buffer.from(..., "base64")` usages and make sure the result is copied or uses `base64ToBytes()`.

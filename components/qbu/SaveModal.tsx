@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 import { formatMm, resolvePrintScale, type PrintScaleSetting } from "./printScale";
+import { useI18n } from "@/components/i18n/I18nProvider";
 
 type Method = "project" | "stl";
 
@@ -64,6 +65,7 @@ export default function SaveModal({
   onExportStl,
   onOpenPrintPrep,
 }: Props) {
+  const { t } = useI18n();
   const [baseName, setBaseName] = useState("Q-BU");
   const [method, setMethod] = useState<Method>("project");
   const [downloadLocal, setDownloadLocal] = useState(false);
@@ -124,7 +126,7 @@ export default function SaveModal({
       className="saveOverlay"
       role="dialog"
       aria-modal="true"
-      aria-label="保存"
+      aria-label={t("save.title")}
       onMouseDown={(e) => {
         if (busy) return;
         if (e.target === e.currentTarget) onClose();
@@ -132,8 +134,8 @@ export default function SaveModal({
     >
       <div className="saveCard">
         <div className="saveHeader">
-          <div className="saveTitle">保存</div>
-          <button type="button" className="saveClose" onClick={onClose} aria-label="閉じる" disabled={busy}>
+          <div className="saveTitle">{t("save.title")}</div>
+          <button type="button" className="saveClose" onClick={onClose} aria-label={t("save.close")} disabled={busy}>
             ✕
           </button>
         </div>
@@ -143,7 +145,7 @@ export default function SaveModal({
           {statusText ? <div className="saveHint">{statusText}</div> : null}
 
           <div className="saveSection">
-            <div className="saveLabel">名前</div>
+            <div className="saveLabel">{t("save.name")}</div>
             <input
               className="saveInput"
               value={baseName}
@@ -155,7 +157,7 @@ export default function SaveModal({
           </div>
 
           <div className="saveSection">
-            <div className="saveLabel">方法</div>
+            <div className="saveLabel">{t("save.method")}</div>
 
             <div
               className={`saveOption ${method === "project" ? "active" : ""}`}
@@ -165,8 +167,8 @@ export default function SaveModal({
             >
               <input type="radio" checked={method === "project"} readOnly />
               <div>
-                <div className="saveOptionTitle">プロジェクト</div>
-                <div className="saveOptionDesc">あとで続きから編集できます</div>
+                <div className="saveOptionTitle">{t("save.method.project")}</div>
+                <div className="saveOptionDesc">{t("save.method.project.desc")}</div>
               </div>
             </div>
 
@@ -178,35 +180,35 @@ export default function SaveModal({
             >
               <input type="radio" checked={method === "stl"} readOnly />
               <div>
-                <div className="saveOptionTitle">STL</div>
-                <div className="saveOptionDesc">3Dプリント用に書き出し</div>
+                <div className="saveOptionTitle">{t("save.method.stl")}</div>
+                <div className="saveOptionDesc">{t("save.method.stl.desc")}</div>
               </div>
             </div>
           </div>
 
           {method === "project" && (
             <div className="saveSection">
-              <div className="saveLabel">保存先</div>
+              <div className="saveLabel">{t("save.destination")}</div>
               <div className="saveHint">
-                MyQ-BUModels（クラウド）に保存します。
+                {t("save.destination.hint")}
                 <br />
-                ※ v1.0.16 から新規の JSON 保存は廃止し、.qbu 形式に統一します。
+                {t("save.destination.noteFormat")}
               </div>
 
               {existingModelId ? (
                 <div className="saveRow" style={{ alignItems: "flex-start" }}>
                   <input type="checkbox" checked={asNew} onChange={(e) => setAsNew(e.target.checked)} disabled={busy} />
                   <div style={{ fontSize: 12, fontWeight: 900, color: "rgba(11,15,24,.72)", lineHeight: 1.35 }}>
-                    新規として保存（コピー）
+                    {t("save.asNew")}
                     <div className="saveHint" style={{ marginTop: 2 }}>
-                      OFFの場合は上書き保存になります。
+                      {t("save.asNew.hint")}
                     </div>
                   </div>
                 </div>
               ) : null}
 
               <div className="saveLabel" style={{ marginTop: 6 }}>
-                ローカル書き出し（任意）
+                {t("save.localExport")}
               </div>
               <div className="saveRow" style={{ alignItems: "flex-start" }}>
                 <input
@@ -216,18 +218,18 @@ export default function SaveModal({
                   disabled={busy}
                 />
                 <div style={{ fontSize: 12, fontWeight: 900, color: "rgba(11,15,24,.72)", lineHeight: 1.35 }}>
-                  .qbu をローカルにも書き出す
-                  <div className="saveHint" style={{ marginTop: 2 }}>外部共有やバックアップ用途。</div>
+                  {t("save.localExport.qbu")}
+                  <div className="saveHint" style={{ marginTop: 2 }}>{t("save.localExport.hint")}</div>
                 </div>
               </div>
 
-              {downloadLocal ? <div className="saveHint">※ v1.0.16 以降、書き出し時のパスワード指定は廃止しました。</div> : null}
+              {downloadLocal ? <div className="saveHint">{t("save.localExport.noteNoPassword")}</div> : null}
             </div>
           )}
 
           {method === "stl" && (
             <div className="saveSection">
-              <div className="saveLabel">サイズ</div>
+              <div className="saveLabel">{t("save.size")}</div>
 
               <div className="saveRow" style={{ flexWrap: "wrap" }}>
                 <button
@@ -236,7 +238,7 @@ export default function SaveModal({
                   onClick={() => setScaleMode("maxSide")}
                   disabled={busy}
                 >
-                  最長辺
+                  {t("save.size.maxSide")}
                 </button>
                 <button
                   type="button"
@@ -244,7 +246,7 @@ export default function SaveModal({
                   onClick={() => setScaleMode("blockEdge")}
                   disabled={busy}
                 >
-                  1ブロック
+                  {t("save.size.blockEdge")}
                 </button>
               </div>
 
@@ -258,7 +260,7 @@ export default function SaveModal({
                       inputMode="numeric"
                       disabled={busy}
                     />
-                    <div className="saveHint">mm（最長辺を {Math.round(resolved.maxSideMm)}mm に）</div>
+                    <div className="saveHint">{t("save.size.mmMaxSide", { mm: Math.round(resolved.maxSideMm) })}</div>
                   </>
                 ) : (
                   <>
@@ -269,22 +271,22 @@ export default function SaveModal({
                       inputMode="decimal"
                       disabled={busy}
                     />
-                    <div className="saveHint">mm（1ブロック辺）→ 最大辺 {formatMm(resolved.maxSideMm, 1)}mm</div>
+                    <div className="saveHint">{t("save.size.mmBlock", { mm: formatMm(resolved.maxSideMm, 1) })}</div>
                   </>
                 )}
               </div>
               <div className="saveHint">
-                現在のモデル：最大 <b>{Math.round(scaleHint.dim)}</b> ブロック ／ 1ブロック辺 <b>{formatMm(scaleHint.blockEdgeMm, 2)}mm</b>
+                {t("save.size.current", { n: Math.round(scaleHint.dim), mm: formatMm(scaleHint.blockEdgeMm, 2) })}
               </div>
 
-              {resolved.warnTooLarge && <div className="warnYellow">⚠ 最大辺が180mmを超えています（印刷依頼には大きすぎます）</div>}
+              {resolved.warnTooLarge && <div className="warnYellow">{t("save.warn.tooLarge")}</div>}
             </div>
           )}
         </div>
 
         <div className="saveActions">
           <button type="button" className="saveBtn" onClick={onClose} disabled={busy}>
-            キャンセル
+            {t("save.cancel")}
           </button>
 
           {method === "project" ? (
@@ -299,12 +301,12 @@ export default function SaveModal({
                 })
               }
             >
-              {busy ? "保存中..." : "保存"}
+              {busy ? t("save.saving") : t("save.save")}
             </button>
           ) : (
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
               <button type="button" className="saveBtn" onClick={() => onExportStl(safeName, finalSetting)} disabled={busy}>
-                STLを書き出す
+                {t("save.exportStl")}
               </button>
               <button
                 type="button"
@@ -312,7 +314,7 @@ export default function SaveModal({
                 onClick={() => onOpenPrintPrep(safeName, finalSetting)}
                 disabled={busy}
               >
-                印刷用にSTLを書き出す
+                {t("save.exportForPrint")}
               </button>
             </div>
           )}

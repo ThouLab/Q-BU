@@ -25,12 +25,17 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(bin);
 }
 
-export function base64ToBytes(b64: string): Uint8Array {
+export function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   // Node / edge
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const anyGlobal = globalThis as any;
   if (typeof anyGlobal.Buffer !== "undefined") {
-    return new Uint8Array(anyGlobal.Buffer.from(String(b64 || ""), "base64"));
+    const buf = anyGlobal.Buffer.from(String(b64 || ""), "base64") as Uint8Array<ArrayBufferLike>;
+    // NOTE: Node Buffer may be backed by SharedArrayBuffer (ArrayBufferLike).
+    // Copy into a plain ArrayBuffer-backed Uint8Array for Blob/TS compatibility.
+    const copy = new Uint8Array(buf.byteLength);
+    copy.set(buf);
+    return copy;
   }
 
   // Browser
@@ -57,9 +62,21 @@ export function formatDateTimeJa(iso: string | null | undefined): string {
  * - 3Dのレンダリングをしないため高速
  * - ギャラリーの一覧用（見分けがつく程度）
  */
-export function generateThumbDataUrl(blocks: Set<string>, cubeColor: string, opts?: { size?: number }): string | null {
+export function generateThumbDataUrl(blocks: Set<string>, cubeColor: string, opts?: { size?: number }): string | null;
+export function generateThumbDataUrl(
+  blocks: Set<string>,
+  opts?: { size?: number; colorsByKey?: Map<string, string> | Record<string, string>; defaultColor?: string }
+): string | null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function generateThumbDataUrl(blocks: Set<string>, arg2?: any, arg3?: any): string | null {
+  // Backward compatible signature:
+  // - v1.0.16 以前: (blocks, cubeColor, opts)
+  // - v1.0.17+   : (blocks, { size, colorsByKey, defaultColor })
+  const legacyColor = typeof arg2 === "string" ? (arg2 as string) : null;
+  const options = (typeof arg2 === "object" && arg2) || (typeof arg3 === "object" && arg3) ? (typeof arg2 === "object" ? arg2 : arg3) : {};
+  const size = Math.max(64, Math.min(512, Math.round(options?.size || 160)));
+
   if (typeof document === "undefined") return null;
-  const size = Math.max(64, Math.min(512, Math.round(opts?.size || 160)));
 
   const canvas = document.createElement("canvas");
   canvas.width = size;
@@ -71,18 +88,41 @@ export function generateThumbDataUrl(blocks: Set<string>, cubeColor: string, opt
   ctx.fillStyle = "#f7f8fb";
   ctx.fillRect(0, 0, size, size);
 
-  const coords = Array.from(blocks).map((k) => parseKey(k));
+  const coords = Array.from(blocks);
   if (coords.length === 0) return canvas.toDataURL("image/png");
+
+  // Top view: 同じ (x,z) に複数ブロックがある場合は最も高い y を採用
+  const topByXZ = new Map<string, { x: number; z: number; y: number; color: string }>();
+
+  const colorsByKey = options?.colorsByKey as
+    | Map<string, string>
+    | Record<string, string>
+    | undefined;
+  const defaultColor = (options?.defaultColor as string) || legacyColor || "#111827";
 
   let minX = Infinity,
     maxX = -Infinity,
     minZ = Infinity,
     maxZ = -Infinity;
-  for (const c of coords) {
+
+  for (const k of coords) {
+    const c = parseKey(k);
     minX = Math.min(minX, c.x);
     maxX = Math.max(maxX, c.x);
     minZ = Math.min(minZ, c.z);
     maxZ = Math.max(maxZ, c.z);
+
+    let col = defaultColor;
+    if (colorsByKey) {
+      if (colorsByKey instanceof Map) col = colorsByKey.get(k) || defaultColor;
+      else col = (colorsByKey as any)[k] || defaultColor;
+    }
+
+    const keyXZ = `${c.x},${c.z}`;
+    const prev = topByXZ.get(keyXZ);
+    if (!prev || c.y >= prev.y) {
+      topByXZ.set(keyXZ, { x: c.x, z: c.z, y: c.y, color: col });
+    }
   }
 
   const w = Math.max(1, maxX - minX + 1);
@@ -96,10 +136,10 @@ export function generateThumbDataUrl(blocks: Set<string>, cubeColor: string, opt
   const oy = Math.floor((size - drawH) / 2);
 
   // blocks
-  ctx.fillStyle = cubeColor || "#111827";
-  for (const c of coords) {
-    const x = ox + (c.x - minX) * cell;
-    const y = oy + (c.z - minZ) * cell;
+  for (const v of topByXZ.values()) {
+    const x = ox + (v.x - minX) * cell;
+    const y = oy + (v.z - minZ) * cell;
+    ctx.fillStyle = v.color || defaultColor;
     ctx.fillRect(x, y, cell, cell);
   }
 

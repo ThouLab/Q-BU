@@ -31,6 +31,8 @@ import {
   type SubKey,
 } from "./subBlocks";
 
+import { useI18n } from "@/components/i18n/I18nProvider";
+
 const STEP_DEG = 45;
 const STEP = (Math.PI / 180) * STEP_DEG;
 
@@ -102,6 +104,8 @@ export default function PrintPrepViewer(props: {
   onRemoveSupport: (k: SubKey) => void;
 }) {
   const { baseBlocks, supportBlocks, floatingBase, floatingSupport, onAddSupport, onRemoveSupport } = props;
+
+  const { t: tr } = useI18n();
 
   // HUD: スマホは情報量を抑える
   const [isCompactHud, setIsCompactHud] = useState(false);
@@ -808,19 +812,19 @@ export default function PrintPrepViewer(props: {
           <div className={`prepHint ${isCompactHud ? "compact" : ""}`}>
             {isCompactHud ? (
               <>
-                タップ: 補完(0.5)追加　長押し: 補完削除
+                {tr("printprep.hint.compact.l1")}
                 <br />
-                2本指: 移動　ピンチ: ズーム
+                {tr("printprep.hint.compact.l2")}
                 <br />
-                赤: 浮動 / 青: 補完
+                {tr("printprep.hint.compact.l3")}
               </>
             ) : (
               <>
-                クリック/タップ: 補完ブロック（0.5）追加　右クリック/長押し: 補完ブロック削除
+                {tr("printprep.hint.full.l1")}
                 <br />
-                中ボタン/2本指: 移動　ホイール/ピンチ: ズーム　Space: 中央へ
+                {tr("printprep.hint.full.l2")}
                 <br />
-                赤: 浮動 / 青: 補完
+                {tr("printprep.hint.full.l3")}
               </>
             )}
           </div>
@@ -828,8 +832,12 @@ export default function PrintPrepViewer(props: {
 
         <div className="prepCountsRow">
           <div className="prepCounts">
-            ブロック: {baseBlocks.size}　補完: {supportBlocks.size}　浮動: {floatingTotal}
-            {floatingSupport.size > 0 && `（支柱:${floatingSupport.size}）`}
+            {tr("printprep.counts", {
+              base: baseBlocks.size.toLocaleString(),
+              supp: supportBlocks.size.toLocaleString(),
+              floating: floatingTotal.toLocaleString(),
+            })}
+            {floatingSupport.size > 0 && tr("printprep.counts.supportFloating", { n: floatingSupport.size.toLocaleString() })}
           </div>
 
           {isCompactHud && (
@@ -837,10 +845,10 @@ export default function PrintPrepViewer(props: {
               type="button"
               className={`miniToggle ${showHelp ? "on" : ""}`}
               onClick={() => setShowHelp((v) => !v)}
-              title="操作"
-              aria-label="操作"
+              title={tr("printprep.controls")}
+              aria-label={tr("printprep.controls")}
             >
-              操作
+              {tr("printprep.controls")}
             </button>
           )}
         </div>
@@ -848,28 +856,28 @@ export default function PrintPrepViewer(props: {
 
       <div className="overlayButtons">
         {showUp && (
-          <button type="button" className="triBtn posUp" onClick={rotateUp} title="上から">
+          <button type="button" className="triBtn posUp" onClick={rotateUp} title={tr("printprep.view.top")}>
             <div className="tri up" />
           </button>
         )}
         {showDown && (
-          <button type="button" className="triBtn posDown" onClick={rotateDown} title="下から">
+          <button type="button" className="triBtn posDown" onClick={rotateDown} title={tr("printprep.view.bottom")}>
             <div className="tri down" />
           </button>
         )}
 
-        <button type="button" className="triBtn posLeft" onClick={rotateLeft} title="左へ">
+        <button type="button" className="triBtn posLeft" onClick={rotateLeft} title={tr("printprep.view.left")}>
           <div className="tri left" />
         </button>
-        <button type="button" className="triBtn posRight" onClick={rotateRight} title="右へ">
+        <button type="button" className="triBtn posRight" onClick={rotateRight} title={tr("printprep.view.right")}>
           <div className="tri right" />
         </button>
 
-        <div className="zoomStack" aria-label="ズーム">
-          <button type="button" className="zoomBtn" onClick={zoomIn} title="寄る">
+        <div className="zoomStack" aria-label={tr("printprep.zoom")}>
+          <button type="button" className="zoomBtn" onClick={zoomIn} title={tr("editor.zoomIn")}>
             ＋
           </button>
-          <button type="button" className="zoomBtn" onClick={zoomOut} title="引く">
+          <button type="button" className="zoomBtn" onClick={zoomOut} title={tr("editor.zoomOut")}>
             －
           </button>
         </div>

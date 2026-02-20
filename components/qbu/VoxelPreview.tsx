@@ -4,8 +4,10 @@ import React, { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 
 import { useTelemetry } from "@/components/telemetry/TelemetryProvider";
+import { useI18n } from "@/components/i18n/I18nProvider";
 
 import { computeBBox, parseKey, type BBox } from "./voxelUtils";
+import { DEFAULT_BLOCK_COLOR } from "./filamentColors";
 import type { RefImages } from "./referenceUtils";
 import type { RefSettings, ViewDir } from "./settings";
 
@@ -38,9 +40,12 @@ type PreviewThree = {
 
   // shared resources
   cubeGeo: any;
-  cubeMat: any;
   edgeGeo: any;
-  edgeMat: any;
+  cubeMats: Map<string, any>; // color -> material
+  edgeMats: Map<string, any>; // styleKey -> material
+
+  // v1.0.17+: per-block colors
+  blockColors: Map<string, string>;
 };
 
 function clamp(v: number, min: number, max: number) {
@@ -54,6 +59,38 @@ function pickEdgeStyle(hex: string) {
     return { color: "#ffffff", opacity: 0.55 };
   }
   return { color: "#111827", opacity: 0.35 };
+}
+
+function normalizeHex(hex: string) {
+  return String(hex || "").trim().toLowerCase();
+}
+
+function getCubeMat(t: PreviewThree, hex: string) {
+  const key = normalizeHex(hex || DEFAULT_BLOCK_COLOR) || DEFAULT_BLOCK_COLOR;
+  const cached = t.cubeMats.get(key);
+  if (cached) return cached;
+  const mat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(key),
+    roughness: 0.55,
+    metalness: 0.05,
+  });
+  t.cubeMats.set(key, mat);
+  return mat;
+}
+
+function getEdgeMat(t: PreviewThree, cubeHex: string) {
+  const style = pickEdgeStyle(cubeHex || DEFAULT_BLOCK_COLOR);
+  const styleKey = `${style.color}_${String(style.opacity)}`;
+  const cached = t.edgeMats.get(styleKey);
+  if (cached) return cached;
+  const mat = new THREE.LineBasicMaterial({
+    color: new THREE.Color(style.color),
+    transparent: true,
+    opacity: style.opacity,
+    depthTest: true,
+  });
+  t.edgeMats.set(styleKey, mat);
+  return mat;
 }
 
 function makePixelTexture(url: string) {
@@ -194,14 +231,17 @@ function rebuildCubes(t: PreviewThree, keys: Set<string>, showEdges: boolean) {
 
   for (const k of keys) {
     const c = parseKey(k);
-    const mesh = new THREE.Mesh(t.cubeGeo, t.cubeMat);
+    const col = (t.blockColors.get(k) || DEFAULT_BLOCK_COLOR) as string;
+    const mesh = new THREE.Mesh(t.cubeGeo, getCubeMat(t, col));
     mesh.position.set(c.x, c.y, c.z);
+    mesh.userData.key = k;
 
-    const edges = new THREE.LineSegments(t.edgeGeo, t.edgeMat);
+    const edges = new THREE.LineSegments(t.edgeGeo, getEdgeMat(t, col));
     edges.name = "edges";
     edges.scale.set(1.01, 1.01, 1.01);
     edges.visible = showEdges;
     edges.renderOrder = 2;
+    edges.userData.key = k;
     mesh.add(edges);
 
     t.cubesGroup.add(mesh);
@@ -210,13 +250,14 @@ function rebuildCubes(t: PreviewThree, keys: Set<string>, showEdges: boolean) {
 
 type Props = {
   blocks: Set<string>;
+  // v1.0.17+: per-block colors
+  blockColors: Map<string, string>;
   bbox: BBox;
   dir: ViewDir;
   onDirChange: (dir: ViewDir) => void;
   onClose: () => void;
 
   // 見た目
-  cubeColor: string;
   showEdges: boolean;
 
   // 3面図（参照）
@@ -233,11 +274,11 @@ type Props = {
 
 export default function VoxelPreview({
   blocks,
+  blockColors,
   bbox,
   dir,
   onDirChange,
   onClose,
-  cubeColor,
   showEdges,
   onImportThreeView,
   hasRefs,
@@ -247,6 +288,7 @@ export default function VoxelPreview({
   refSettings,
 }: Props) {
   const { track } = useTelemetry();
+  const { t } = useI18n();
   const trackRef = useRef(track);
   useEffect(() => {
     trackRef.current = track;
@@ -313,21 +355,11 @@ export default function VoxelPreview({
     const cubesGroup = new THREE.Group();
     root.add(cubesGroup);
 
-    // shared cube material (単色) + edge
+    // shared geometry + material pools
     const cubeGeo = new THREE.BoxGeometry(1, 1, 1);
-    const cubeMat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(cubeColor),
-      roughness: 0.55,
-      metalness: 0.05,
-    });
     const edgeGeo = new THREE.EdgesGeometry(cubeGeo);
-    const edgeStyle = pickEdgeStyle(cubeColor);
-    const edgeMat = new THREE.LineBasicMaterial({
-      color: new THREE.Color(edgeStyle.color),
-      transparent: edgeStyle.opacity < 1,
-      opacity: edgeStyle.opacity,
-      depthTest: true,
-    });
+    const cubeMats = new Map<string, any>();
+    const edgeMats = new Map<string, any>();
 
     threeRef.current = {
       renderer,
@@ -341,9 +373,10 @@ export default function VoxelPreview({
       refTextures: {},
       refUrls: {},
       cubeGeo,
-      cubeMat,
       edgeGeo,
-      edgeMat,
+      cubeMats,
+      edgeMats,
+      blockColors,
     };
 
     rebuildCubes(threeRef.current, blocks, showEdges);
@@ -384,9 +417,10 @@ export default function VoxelPreview({
         Object.values(threeRef.current.refTextures).forEach((tex) => tex?.dispose());
         Object.values(threeRef.current.refPlanes).forEach((p) => p && disposeObject3D(p));
         threeRef.current.cubeGeo?.dispose?.();
-        threeRef.current.cubeMat?.dispose?.();
         threeRef.current.edgeGeo?.dispose?.();
-        threeRef.current.edgeMat?.dispose?.();
+
+        for (const m of threeRef.current.cubeMats?.values?.() || []) m?.dispose?.();
+        for (const m of threeRef.current.edgeMats?.values?.() || []) m?.dispose?.();
       }
       renderer.dispose();
       wrap.removeChild(renderer.domElement);
@@ -417,18 +451,14 @@ export default function VoxelPreview({
   }, [showEdges]);
 
   useEffect(() => {
-    // 色変更 → shared material に反映
+    // v1.0.17+: per-block colors
     const t = threeRef.current;
     if (!t) return;
-    t.cubeMat.color.set(cubeColor);
-    const edgeStyle = pickEdgeStyle(cubeColor);
-    t.edgeMat.color.set(edgeStyle.color);
-    t.edgeMat.opacity = edgeStyle.opacity;
-    t.edgeMat.transparent = edgeStyle.opacity < 1;
-    t.edgeMat.needsUpdate = true;
+    t.blockColors = blockColors;
+    rebuildCubes(t, blocks, showEdges);
     renderOnce();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cubeColor]);
+  }, [blockColors]);
 
   useEffect(() => {
     const t = threeRef.current;
@@ -466,36 +496,36 @@ export default function VoxelPreview({
         <div className="previewHudRow">
           <div className="pvGroup">
             <button type="button" className={`pvChip ${dir === "front" ? "active" : ""}`} onClick={() => onDirChange("front")}>
-              前
+              {t("preview.front")}
             </button>
             <button type="button" className={`pvChip ${dir === "back" ? "active" : ""}`} onClick={() => onDirChange("back")}>
-              後
+              {t("preview.back")}
             </button>
             <button type="button" className={`pvChip ${dir === "left" ? "active" : ""}`} onClick={() => onDirChange("left")}>
-              左
+              {t("preview.left")}
             </button>
             <button type="button" className={`pvChip ${dir === "right" ? "active" : ""}`} onClick={() => onDirChange("right")}>
-              右
+              {t("preview.right")}
             </button>
             <button type="button" className={`pvChip ${dir === "top" ? "active" : ""}`} onClick={() => onDirChange("top")}>
-              上
+              {t("preview.top")}
             </button>
             <button type="button" className={`pvChip ${dir === "bottom" ? "active" : ""}`} onClick={() => onDirChange("bottom")}>
-              下
+              {t("preview.bottom")}
             </button>
 
             {/* ズーム */}
-            <button type="button" className="pvChip" onClick={zoomIn} title="寄る">
+            <button type="button" className="pvChip" onClick={zoomIn} title={t("editor.zoomIn")}>
               ＋
             </button>
-            <button type="button" className="pvChip" onClick={zoomOut} title="引く">
+            <button type="button" className="pvChip" onClick={zoomOut} title={t("editor.zoomOut")}>
               －
             </button>
           </div>
 
           <div className="pvGroup">
             <label className="pvChip">
-              3面図
+              {t("preview.threeView")}
               <input
                 type="file"
                 accept="image/*"
@@ -509,11 +539,11 @@ export default function VoxelPreview({
             </label>
             {hasRefs && (
               <button type="button" className="pvChip" onClick={onClearRefs}>
-                消す
+                {t("preview.clear")}
               </button>
             )}
             <button type="button" className="pvChip" onClick={onClose}>
-              閉じる
+              {t("preview.close")}
             </button>
           </div>
         </div>

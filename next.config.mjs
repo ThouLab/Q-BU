@@ -1,10 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // 開発時に左下などに出る Next.js のインジケーター（Nバッジ）を非表示
-  devIndicators: {
-    buildActivity: false,
-  },
+  // NOTE: Next.js 15.5+ では devIndicators.buildActivity は deprecated
+  // （設定しても効かない）ため、設定自体を削除しています。
 };
 
 export default nextConfig;

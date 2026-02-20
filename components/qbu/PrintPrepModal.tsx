@@ -2,6 +2,8 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 
+import { useI18n } from "@/components/i18n/I18nProvider";
+
 import PrintPrepViewer from "./PrintPrepViewer";
 import { analyzePrintPrepSupport, suggestCompletionSupportBlocks } from "./printPrepUtils";
 import { computeMixedBBox, expandBaseBlocksToSubCells, type SubKey } from "./subBlocks";
@@ -35,6 +37,7 @@ export default function PrintPrepModal({
   onExport,
   onRequestPrint,
 }: PrintPrepModalProps) {
+  const { t } = useI18n();
   const [supportBlocks, setSupportBlocks] = useState<Set<SubKey>>(new Set());
 
   // Active pricing (v1.0.15-γ)
@@ -52,7 +55,7 @@ export default function PrintPrepModal({
   // base blocks occupy 8 sub-cells each; used to prevent placing supports inside bases
   const baseSubCells = useMemo(() => expandBaseBlocksToSubCells(baseBlocks), [baseBlocks]);
 
-  // 初回オープン時に自動提案を入れる
+  // 初回オープン時に自動提案を入れる + UI初期化
   useEffect(() => {
     if (!open) return;
     const suggested = suggestCompletionSupportBlocks(baseBlocks);
@@ -159,30 +162,32 @@ export default function PrintPrepModal({
   const tooLarge = resolvedScale.warnTooLarge;
 
   const statusText = isReady
-    ? "浮動するブロックはありません。"
-    : `浮動するブロックがあります（${analysis.componentCount}パーツ）。`;
+    ? t("printprep.status.ready")
+    : t("printprep.status.floating", { n: analysis.componentCount });
 
-  const helpText = isReady
-    ? "このまま印刷できます。"
-    : "赤い部分が浮いています。青いブロックは自動補完（0.5サイズ）です（不要なら右クリックで削除、クリックで追加）。";
+  const helpText = isReady ? t("printprep.help.ready") : t("printprep.help.floating");
 
   return (
     <div className="prepOverlay" role="dialog" aria-modal="true">
       <div className="prepCard">
         <div className="prepHeader">
           <div>
-            <div className="prepTitle">印刷用につなぎ目を補完</div>
+            <div className="prepTitle">{t("printprep.title")}</div>
             <div className="prepSub">
-              {baseName} ／ {resolvedScale.mode === "maxSide" ? (
-                <>最大辺 {formatMm(resolvedScale.maxSideMm, 0)}mm</>
+              {baseName} ／{" "}
+              {resolvedScale.mode === "maxSide" ? (
+                <>{t("printprep.sub.maxSide", { mm: formatMm(resolvedScale.maxSideMm, 0) })}</>
               ) : (
                 <>
-                  1ブロック {formatMm(resolvedScale.mmPerUnit, 2)}mm（最大辺 {formatMm(resolvedScale.maxSideMm, 1)}mm）
+                  {t("printprep.sub.blockEdge", {
+                    mm: formatMm(resolvedScale.mmPerUnit, 2),
+                    max: formatMm(resolvedScale.maxSideMm, 1),
+                  })}
                 </>
               )}
             </div>
           </div>
-          <button type="button" className="saveClose" onClick={onClose} aria-label="close">
+          <button type="button" className="saveClose" onClick={onClose} aria-label={t("common.close")}>
             ✕
           </button>
         </div>
@@ -206,20 +211,20 @@ export default function PrintPrepModal({
 
               <div style={{ marginTop: 10, display: "grid", gap: 8 }}>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                  <span style={{ fontSize: 12, fontWeight: 900, color: "#374151" }}>印刷サイズ</span>
+                  <span style={{ fontSize: 12, fontWeight: 900, color: "#374151" }}>{t("printprep.size")}</span>
                   <button
                     type="button"
                     className={`chip ${scaleMode === "maxSide" ? "active" : ""}`}
                     onClick={() => setScaleMode("maxSide")}
                   >
-                    最長辺
+                    {t("save.size.maxSide")}
                   </button>
                   <button
                     type="button"
                     className={`chip ${scaleMode === "blockEdge" ? "active" : ""}`}
                     onClick={() => setScaleMode("blockEdge")}
                   >
-                    1ブロック
+                    {t("save.size.blockEdge")}
                   </button>
                 </div>
 
@@ -232,7 +237,7 @@ export default function PrintPrepModal({
                         onChange={(e) => setMaxSideMmText(e.target.value)}
                         inputMode="numeric"
                       />
-                      <div className="saveHint">mm（最長辺を {formatMm(resolvedScale.maxSideMm, 0)}mm に）</div>
+                      <div className="saveHint">{t("save.size.mmMaxSide", { mm: formatMm(resolvedScale.maxSideMm, 0) })}</div>
                     </>
                   ) : (
                     <>
@@ -242,15 +247,15 @@ export default function PrintPrepModal({
                         onChange={(e) => setBlockEdgeMmText(e.target.value)}
                         inputMode="decimal"
                       />
-                      <div className="saveHint">mm（1ブロック辺）→ 最大辺 {formatMm(resolvedScale.maxSideMm, 1)}mm</div>
+                      <div className="saveHint">{t("save.size.mmBlock", { mm: formatMm(resolvedScale.maxSideMm, 1) })}</div>
                     </>
                   )}
                 </div>
 
-                {tooLarge && <div className="warnYellow">⚠ 最大辺が180mmを超えています（印刷依頼には大きすぎます）</div>}
+                {tooLarge && <div className="warnYellow">{t("save.warn.tooLarge")}</div>}
 
                 <div className="saveHint">
-                  概算見積（送料別）: <b>{formatYen(quote.subtotalYen)}円</b> ／ 推定体積 {formatMm(quote.volumeCm3, 1)}cm³
+                  {t("printprep.quote", { yen: formatYen(quote.subtotalYen), vol: formatMm(quote.volumeCm3, 1) })}
                 </div>
               </div>
             </div>
@@ -264,11 +269,11 @@ export default function PrintPrepModal({
                   setSupportBlocks(suggested);
                 }}
               >
-                自動補完
+                {t("printprep.auto")}
               </button>
 
               <button type="button" className="saveBtn" onClick={() => setSupportBlocks(new Set())}>
-                補完を消す
+                {t("printprep.clear")}
               </button>
 
               {isReady && (
@@ -277,7 +282,7 @@ export default function PrintPrepModal({
                   className="saveBtn primary"
                   onClick={() => onExport(baseName, finalSetting, baseBlocks, supportBlocks)}
                 >
-                  書き出す（STL）
+                  {t("printprep.exportStl")}
                 </button>
               )}
 
@@ -287,9 +292,9 @@ export default function PrintPrepModal({
                   className="saveBtn"
                   disabled={tooLarge}
                   onClick={() => onRequestPrint(baseName, finalSetting, baseBlocks, supportBlocks)}
-                  title={tooLarge ? "最大辺が180mmを超えるため、印刷依頼できません" : ""}
+                  title={tooLarge ? t("printprep.requestDisabled") : ""}
                 >
-                  印刷を依頼する
+                  {t("printprep.request")}
                 </button>
               )}
             </div>

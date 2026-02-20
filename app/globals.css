@@ -83,11 +83,92 @@ canvas {
   font-size: 18px;
 }
 
+/* ===== Mode dropdown (top-left) ===== */
+.modeSelectWrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(11, 15, 24, 0.14);
+  background: rgba(255, 255, 255, 0.75);
+  border-radius: 12px;
+}
+
+.modeSelectWrap::after {
+  content: "▾";
+  position: absolute;
+  right: 10px;
+  pointer-events: none;
+  opacity: 0.65;
+  font-weight: 900;
+  font-size: 12px;
+}
+
+.modeSelect {
+  appearance: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-weight: 1000;
+  font-size: 12px;
+  padding: 6px 26px 6px 10px;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.modeSelect:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .headerRight {
   display: flex;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+/* Center project name in the header (ok to clip / overlap on narrow screens) */
+.headerCenter {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(46vw, 520px);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  pointer-events: auto;
+}
+
+.projectNameBtn {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  font-weight: 1000;
+  font-size: 14px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  cursor: text;
+  color: rgba(11, 15, 24, 0.86);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.projectNameBtn:hover {
+  border-color: rgba(11, 15, 24, 0.12);
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.projectNameInput {
+  width: 100%;
+  max-width: 100%;
+  border: 1px solid rgba(11, 15, 24, 0.14);
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: 12px;
+  padding: 7px 10px;
+  font-weight: 1000;
+  font-size: 14px;
+  outline: none;
 }
 
 .hgroup {
@@ -101,6 +182,11 @@ canvas {
   appearance: none;
   cursor: pointer;
   user-select: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  color: inherit;
   border: 1px solid var(--border);
   background: var(--btnBg);
   padding: 9px 12px;
@@ -533,10 +619,10 @@ canvas {
 
 /* ===== Account (bottom-left) ===== */
 .accountFabWrap {
-  position: absolute;
+  position: fixed;
   left: 14px;
   bottom: 14px;
-  z-index: 7;
+  z-index: 20;
   pointer-events: auto;
 }
 
@@ -580,16 +666,109 @@ canvas {
   border: 1px solid rgba(255, 255, 255, 0.95);
 }
 
-.accountPanel {
-  position: absolute;
+/* ===== Account drawer (left-side) ===== */
+.accountDrawerOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.12);
+  z-index: 200;
+}
+
+.accountDrawer {
+  position: fixed;
+  top: 0;
   left: 0;
-  bottom: 56px;
-  width: 260px;
+  height: 100vh;
+  width: min(360px, 92vw);
   background: rgba(255, 255, 255, 0.96);
-  border: 1px solid rgba(11, 15, 24, 0.14);
-  border-radius: 14px;
+  border-right: 1px solid rgba(11, 15, 24, 0.14);
   box-shadow: 0 18px 34px rgba(11, 15, 24, 0.14);
+  display: flex;
+  flex-direction: column;
+  z-index: 201;
+}
+
+.accountDrawerHeader {
+  padding: 12px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid rgba(11, 15, 24, 0.12);
+}
+
+.accountDrawerTitle {
+  font-weight: 1000;
+  font-size: 14px;
+  color: rgba(11, 15, 24, 0.86);
+}
+
+.accountDrawerClose {
+  border: 1px solid rgba(11, 15, 24, 0.14);
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: 12px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 1000;
+  cursor: pointer;
+}
+
+.accountDrawerClose:hover {
+  background: rgba(11, 15, 24, 0.04);
+}
+
+.accountDrawerBody {
+  padding: 12px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.accountSection {
+  border: 1px solid rgba(11, 15, 24, 0.12);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.92);
   padding: 10px;
+}
+
+.accountSectionTitle {
+  font-size: 12px;
+  font-weight: 1000;
+  color: rgba(11, 15, 24, 0.82);
+  margin-bottom: 8px;
+  word-break: break-word;
+}
+
+.accountLinkGrid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+.accountLink {
+  text-align: left;
+  border: 1px solid rgba(11, 15, 24, 0.14);
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 1000;
+  cursor: pointer;
+}
+
+.accountLink:hover {
+  background: rgba(11, 15, 24, 0.04);
+}
+
+.accountSelect {
+  border: 1px solid rgba(11, 15, 24, 0.14);
+  background: rgba(255, 255, 255, 0.92);
+  border-radius: 12px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 900;
+  outline: none;
 }
 
 .accountTitle {

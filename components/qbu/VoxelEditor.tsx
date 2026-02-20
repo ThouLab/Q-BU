@@ -3,11 +3,11 @@
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 
-import AccountFab from "@/components/account/AccountFab";
 import { useTelemetry } from "@/components/telemetry/TelemetryProvider";
+import { useI18n } from "@/components/i18n/I18nProvider";
 
 import { add, computeBBox, keyOf, parseKey, type Coord } from "./voxelUtils";
-import { BAMBU_FILAMENT_COLORS } from "./filamentColors";
+import { DEFAULT_BLOCK_COLOR } from "./filamentColors";
 import type { RefImages } from "./referenceUtils";
 import type { RefSettings } from "./settings";
 
@@ -114,9 +114,9 @@ type EditorThree = {
 
   // shared resources
   cubeGeo: any;
-  cubeMat: any;
   edgeGeo: any;
-  edgeMat: any;
+  cubeMats: Map<string, any>; // color -> material
+  edgeMats: Map<string, any>; // styleKey -> material
 
   // camera animation / zoom
   anim: { yaw: number; pitch: number; baseRadius: number; zoom: number; center: Coord };
@@ -146,6 +146,16 @@ type Props = {
   blocks: Set<string>;
   setBlocks: React.Dispatch<React.SetStateAction<Set<string>>>;
 
+  // v1.0.17+: per-block colors
+  blockColors: Map<string, string>;
+  setBlockColors: React.Dispatch<React.SetStateAction<Map<string, string>>>;
+
+  // v1.0.17+: editor mode & paint selection
+  editorMode: "model" | "paint";
+  setEditorMode: React.Dispatch<React.SetStateAction<"model" | "paint">>;
+  paintColor: string;
+  setPaintColor: React.Dispatch<React.SetStateAction<string>>;
+
   // 編集視点（45°刻み）
   yawIndex: number;
   pitchIndex: number;
@@ -160,9 +170,7 @@ type Props = {
   cubeCount: number;
   onClearAll: () => void;
 
-  // 見た目（単色 + エッジ）
-  cubeColor: string;
-  setCubeColor: React.Dispatch<React.SetStateAction<string>>;
+  // 見た目（エッジ）
   showEdges: boolean;
   setShowEdges: React.Dispatch<React.SetStateAction<boolean>>;
 
@@ -177,6 +185,11 @@ type Props = {
 export default function VoxelEditor({
   blocks,
   setBlocks,
+  blockColors,
+  setBlockColors,
+  editorMode,
+  paintColor,
+  setPaintColor,
   yawIndex,
   pitchIndex,
   setYawIndex,
@@ -185,8 +198,6 @@ export default function VoxelEditor({
   onOpenPreview,
   cubeCount,
   onClearAll,
-  cubeColor,
-  setCubeColor,
   showEdges,
   setShowEdges,
   refImages,
@@ -194,6 +205,7 @@ export default function VoxelEditor({
   onFileDrop,
 }: Props) {
   const { track } = useTelemetry();
+  const { t } = useI18n();
   const trackRef = useRef(track);
   useEffect(() => {
     trackRef.current = track;
@@ -201,7 +213,6 @@ export default function VoxelEditor({
 
   // --- HUD: モバイルでは情報量を抑える（PCは従来どおり） ---
   const [isCompactHud, setIsCompactHud] = useState(false);
-  const [showHelp, setShowHelp] = useState(true);
   const [showLook, setShowLook] = useState(true);
 
   useEffect(() => {
@@ -213,18 +224,19 @@ export default function VoxelEditor({
   }, []);
 
   useEffect(() => {
-    // スマホはデフォルトで「ヘルプ/見た目」を畳む
+    // スマホはデフォルトで「見た目」を畳む
     if (isCompactHud) {
-      setShowHelp(false);
       setShowLook(false);
     } else {
-      setShowHelp(true);
       setShowLook(true);
     }
   }, [isCompactHud]);
 
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const threeRef = useRef<EditorThree | null>(null);
+
+  const ORIGIN_KEY = keyOf({ x: 0, y: 0, z: 0 });
+
 
   // hover 中の「追加候補位置」
   const hoverRef = useRef<Coord | null>(null);
@@ -234,6 +246,27 @@ export default function VoxelEditor({
   useEffect(() => {
     blocksRef.current = blocks;
   }, [blocks]);
+
+  const blockColorsRef = useRef(blockColors);
+  useEffect(() => {
+    blockColorsRef.current = blockColors;
+  }, [blockColors]);
+
+  const editorModeRef = useRef(editorMode);
+  useEffect(() => {
+    editorModeRef.current = editorMode;
+    // mode切替時はホバー表示をリセット
+    hoverRef.current = null;
+    const t = threeRef.current;
+    if (!t) return;
+    t.highlightPlane.visible = false;
+    t.previewCube.visible = false;
+  }, [editorMode]);
+
+  const paintColorRef = useRef(paintColor);
+  useEffect(() => {
+    paintColorRef.current = paintColor;
+  }, [paintColor]);
 
   const refImagesRef = useRef(refImages);
   const refSettingsRef = useRef(refSettings);
@@ -256,17 +289,137 @@ export default function VoxelEditor({
     });
   }, [showEdges]);
 
-  useEffect(() => {
-    // 色変更 → shared material に反映
-    const t = threeRef.current;
-    if (!t) return;
-    t.cubeMat.color.set(cubeColor);
-    const edgeStyle = pickEdgeStyle(cubeColor);
-    t.edgeMat.color.set(edgeStyle.color);
-    t.edgeMat.opacity = edgeStyle.opacity;
-    t.edgeMat.transparent = edgeStyle.opacity < 1;
-    t.edgeMat.needsUpdate = true;
-  }, [cubeColor]);
+  // v1.0.17+: 色はブロック単位（material pool で色ごとに共有して描画）
+
+  
+type UndoAction =
+  | { kind: "add"; key: string; color: string }
+  | { kind: "remove"; key: string; color: string }
+  | { kind: "paint"; key: string; from: string; to: string }
+  | { kind: "bucket"; keys: string[]; from: string; to: string };
+
+const undoStackRef = useRef<UndoAction[]>([]);
+const redoStackRef = useRef<UndoAction[]>([]);
+
+const pushUndo = (a: UndoAction) => {
+  undoStackRef.current.push(a);
+  if (undoStackRef.current.length > 200) undoStackRef.current.shift();
+  // 新しい操作が来たら redo は捨てる
+  redoStackRef.current = [];
+};
+
+const applyAdd = (k: string, col: string) => {
+  setBlocks((prev) => {
+    if (prev.has(k)) return prev;
+    const next = new Set(prev);
+    next.add(k);
+    return next;
+  });
+  setBlockColors((prev) => {
+    const next = new Map(prev);
+    next.set(k, col);
+    return next;
+  });
+};
+
+const applyRemove = (k: string) => {
+  setBlocks((prev) => {
+    if (!prev.has(k)) return prev;
+    const next = new Set(prev);
+    next.delete(k);
+    if (next.size === 0) next.add(ORIGIN_KEY);
+    return next;
+  });
+  setBlockColors((prev) => {
+    const next = new Map(prev);
+    next.delete(k);
+    if (next.size === 0) next.set(ORIGIN_KEY, DEFAULT_BLOCK_COLOR);
+    return next;
+  });
+};
+
+const applyPaint = (k: string, col: string) => {
+  setBlockColors((prev) => {
+    if (!prev.has(k)) return prev;
+    const next = new Map(prev);
+    next.set(k, col);
+    return next;
+  });
+};
+
+const applyBucket = (keys: string[], col: string) => {
+  setBlockColors((prev) => {
+    const next = new Map(prev);
+    for (const kk of keys) if (next.has(kk)) next.set(kk, col);
+    return next;
+  });
+};
+
+const undo = () => {
+  const a = undoStackRef.current.pop();
+  if (!a) return;
+
+  if (a.kind === "add") {
+    applyRemove(a.key);
+  } else if (a.kind === "remove") {
+    applyAdd(a.key, a.color);
+  } else if (a.kind === "paint") {
+    applyPaint(a.key, a.from);
+  } else if (a.kind === "bucket") {
+    applyBucket(a.keys, a.from);
+  }
+
+  redoStackRef.current.push(a);
+  trackRef.current("undo", { kind: a.kind });
+};
+
+const redo = () => {
+  const a = redoStackRef.current.pop();
+  if (!a) return;
+
+  if (a.kind === "add") {
+    applyAdd(a.key, a.color);
+  } else if (a.kind === "remove") {
+    applyRemove(a.key);
+  } else if (a.kind === "paint") {
+    applyPaint(a.key, a.to);
+  } else if (a.kind === "bucket") {
+    applyBucket(a.keys, a.to);
+  }
+
+  undoStackRef.current.push(a);
+  trackRef.current("redo", { kind: a.kind });
+};
+
+const normalizeHex = (hex: string) => String(hex || "").trim().toLowerCase();
+
+  const getCubeMat = (t: EditorThree, hex: string) => {
+    const key = normalizeHex(hex || DEFAULT_BLOCK_COLOR) || DEFAULT_BLOCK_COLOR;
+    const cached = t.cubeMats.get(key);
+    if (cached) return cached;
+    const mat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(key),
+      roughness: 0.55,
+      metalness: 0.05,
+    });
+    t.cubeMats.set(key, mat);
+    return mat;
+  };
+
+  const getEdgeMat = (t: EditorThree, cubeHex: string) => {
+    const style = pickEdgeStyle(cubeHex || DEFAULT_BLOCK_COLOR);
+    const styleKey = `${style.color}_${String(style.opacity)}`;
+    const cached = t.edgeMats.get(styleKey);
+    if (cached) return cached;
+    const mat = new THREE.LineBasicMaterial({
+      color: new THREE.Color(style.color),
+      transparent: true,
+      opacity: style.opacity,
+      depthTest: true,
+    });
+    t.edgeMats.set(styleKey, mat);
+    return mat;
+  };
 
   const requestAudioContext = () => {
     const t = threeRef.current;
@@ -380,18 +533,21 @@ export default function VoxelEditor({
 
     for (const k of keys) {
       const c = parseKey(k);
-      const mesh = new THREE.Mesh(t.cubeGeo, t.cubeMat);
+      const col = (blockColorsRef.current.get(k) || DEFAULT_BLOCK_COLOR) as string;
+      const mesh = new THREE.Mesh(t.cubeGeo, getCubeMat(t, col));
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       mesh.position.set(c.x, c.y, c.z);
       mesh.userData.coord = c;
+      mesh.userData.key = k;
 
       // cube edge (toggle)
-      const edges = new THREE.LineSegments(t.edgeGeo, t.edgeMat);
+      const edges = new THREE.LineSegments(t.edgeGeo, getEdgeMat(t, col));
       edges.name = "edges";
       edges.scale.set(1.01, 1.01, 1.01);
       edges.visible = showEdgesRef.current;
       edges.renderOrder = 2;
+      edges.userData.key = k;
       mesh.add(edges);
 
       t.cubesGroup.add(mesh);
@@ -455,21 +611,11 @@ export default function VoxelEditor({
     cubesGroup.name = "cubes";
     root.add(cubesGroup);
 
-    // shared cube material (単色) + edge
+    // shared geometry + material pools
     const cubeGeo = new THREE.BoxGeometry(1, 1, 1);
-    const cubeMat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(cubeColor),
-      roughness: 0.55,
-      metalness: 0.05,
-    });
     const edgeGeo = new THREE.EdgesGeometry(cubeGeo);
-    const edgeStyle = pickEdgeStyle(cubeColor);
-    const edgeMat = new THREE.LineBasicMaterial({
-      color: new THREE.Color(edgeStyle.color),
-      transparent: edgeStyle.opacity < 1,
-      opacity: edgeStyle.opacity,
-      depthTest: true,
-    });
+    const cubeMats = new Map<string, any>();
+    const edgeMats = new Map<string, any>();
 
     // highlight plane（面ホバー）
     const hpGeo = new THREE.PlaneGeometry(0.96, 0.96);
@@ -530,9 +676,9 @@ export default function VoxelEditor({
       refUrls: {},
 
       cubeGeo,
-      cubeMat,
       edgeGeo,
-      edgeMat,
+      cubeMats,
+      edgeMats,
       anim: {
         yaw: iyaw,
         pitch: ipitch,
@@ -580,6 +726,8 @@ export default function VoxelEditor({
       const t = threeRef.current;
       if (!t) return;
 
+      const mode = editorModeRef.current;
+
       toNDCXY(clientX, clientY);
       t.raycaster.setFromCamera(t.mouse, t.camera);
 
@@ -601,6 +749,25 @@ export default function VoxelEditor({
       const normalWorld = faceNormalLocal.applyMatrix3(new THREE.Matrix3().getNormalMatrix(obj.matrixWorld)).normalize();
       const n = snapAxisNormal(normalWorld);
 
+      if (mode === "paint") {
+        // paint mode: hover target is the existing block itself
+        hoverRef.current = coord;
+
+        // highlight plane position/orientation (on the hovered face)
+        t.highlightPlane.position.set(coord.x + n.x * 0.5, coord.y + n.y * 0.5, coord.z + n.z * 0.5);
+        const q = new THREE.Quaternion();
+        q.setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(n.x, n.y, n.z));
+        t.highlightPlane.quaternion.copy(q);
+
+        // preview cube at the block (show selected paint color)
+        t.previewCube.position.set(coord.x, coord.y, coord.z);
+        (t.previewCube.material as any).color.set(paintColorRef.current || DEFAULT_BLOCK_COLOR);
+        t.highlightPlane.visible = true;
+        t.previewCube.visible = true;
+        return;
+      }
+
+      // model mode: hover target is neighbor cell (add)
       const target = add(coord, n);
       hoverRef.current = target;
 
@@ -628,12 +795,54 @@ export default function VoxelEditor({
       const target = hoverRef.current;
       if (!target) return;
 
-      const k = keyOf(target);
-      setBlocks((prev) => {
+      const mode = editorModeRef.current;
+
+      if (mode === "paint") {
+  const k = keyOf(target);
+  const toCol = paintColorRef.current || DEFAULT_BLOCK_COLOR;
+
+  // Ctrl+Z / Shift+Ctrl+Z 用
+  const fromCol = blockColorsRef.current.get(k) || DEFAULT_BLOCK_COLOR;
+  if (normalizeHex(fromCol) !== normalizeHex(toCol)) {
+    pushUndo({ kind: "paint", key: k, from: fromCol, to: toCol });
+  } else {
+    const ac = requestAudioContext();
+    if (ac) playClick(ac);
+    return;
+  }
+
+  setBlockColors((prev) => {
+    if (!prev.has(k)) return prev;
+    const next = new Map(prev);
+    next.set(k, toCol);
+    trackRef.current("voxel_paint", { x: target.x, y: target.y, z: target.z, color: toCol });
+    return next;
+  });
+
+  const ac = requestAudioContext();
+  if (ac) playClick(ac);
+  return;
+}
+const k = keyOf(target);
+const col = paintColorRef.current || DEFAULT_BLOCK_COLOR;
+
+if (!blocksRef.current.has(k)) {
+  pushUndo({ kind: "add", key: k, color: col });
+}
+
+setBlocks((prev) => {
         if (prev.has(k)) return prev;
         const next = new Set(prev);
         next.add(k);
         trackRef.current("voxel_add", { x: target.x, y: target.y, z: target.z, blocks: next.size });
+        return next;
+      });
+
+      // v1.0.17+: new blocks start as current selected color
+      setBlockColors((prev) => {
+        if (prev.has(k)) return prev;
+        const next = new Map(prev);
+        next.set(k, col);
         return next;
       });
 
@@ -645,6 +854,8 @@ export default function VoxelEditor({
       const t = threeRef.current;
       if (!t) return;
 
+      const mode = editorModeRef.current;
+
       toNDCXY(clientX, clientY);
       t.raycaster.setFromCamera(t.mouse, t.camera);
       const hits = t.raycaster.intersectObjects(t.cubesGroup.children, false);
@@ -654,12 +865,80 @@ export default function VoxelEditor({
       const c = obj.userData.coord as Coord;
       const k = keyOf(c);
 
+      if (mode === "paint") {
+        // bucket fill: 右クリック/長押しで同色連結領域を塗りつぶし
+        const fromColRaw = blockColorsRef.current.get(k) || DEFAULT_BLOCK_COLOR;
+        const toColRaw = paintColorRef.current || DEFAULT_BLOCK_COLOR;
+        const fromCol = normalizeHex(fromColRaw);
+        const toCol = normalizeHex(toColRaw);
+
+        if (fromCol === toCol) return;
+
+        const keysSet = blocksRef.current;
+        const colorsMap = blockColorsRef.current;
+        const visited = new Set<string>();
+        const q: Coord[] = [{ x: c.x, y: c.y, z: c.z }];
+        let qi = 0;
+        const fillKeys: string[] = [];
+        const dirs: Coord[] = [
+          { x: 1, y: 0, z: 0 },
+          { x: -1, y: 0, z: 0 },
+          { x: 0, y: 1, z: 0 },
+          { x: 0, y: -1, z: 0 },
+          { x: 0, y: 0, z: 1 },
+          { x: 0, y: 0, z: -1 },
+        ];
+
+        while (qi < q.length) {
+          const cur = q[qi++]!;
+          const kk = keyOf(cur);
+          if (visited.has(kk)) continue;
+          visited.add(kk);
+          if (!keysSet.has(kk)) continue;
+          const curCol = normalizeHex(colorsMap.get(kk) || DEFAULT_BLOCK_COLOR);
+          if (curCol !== fromCol) continue;
+          fillKeys.push(kk);
+          for (const d of dirs) q.push(add(cur, d));
+        }
+
+        if (fillKeys.length === 0) return;
+
+        pushUndo({ kind: "bucket", keys: fillKeys, from: fromColRaw, to: toColRaw });
+
+        setBlockColors((prev) => {
+          const next = new Map(prev);
+          for (const kk of fillKeys) {
+            if (next.has(kk)) next.set(kk, toColRaw);
+          }
+          trackRef.current("paint_bucket", { x: c.x, y: c.y, z: c.z, from: fromColRaw, to: toColRaw, count: fillKeys.length });
+          return next;
+        });
+        const ac = requestAudioContext();
+        if (ac) playClick(ac);
+        return;
+      }
+
+// Ctrl+Z / Shift+Ctrl+Z 用（削除）
+if (blocksRef.current.size <= 1) return;
+if (!blocksRef.current.has(k)) return;
+const removedCol = blockColorsRef.current.get(k) || DEFAULT_BLOCK_COLOR;
+pushUndo({ kind: "remove", key: k, color: removedCol });
+
       setBlocks((prev) => {
         if (prev.size <= 1) return prev; // 最後の1個は残す
         const next = new Set(prev);
         next.delete(k);
         if (next.size === 0) next.add(keyOf({ x: 0, y: 0, z: 0 }));
         trackRef.current("voxel_remove", { x: c.x, y: c.y, z: c.z, blocks: next.size });
+        return next;
+      });
+
+      setBlockColors((prev) => {
+        if (prev.size <= 1) return prev;
+        if (!prev.has(k)) return prev;
+        const next = new Map(prev);
+        next.delete(k);
+        if (next.size === 0) next.set(keyOf({ x: 0, y: 0, z: 0 }), DEFAULT_BLOCK_COLOR);
         return next;
       });
 
@@ -945,17 +1224,28 @@ export default function VoxelEditor({
     };
 
     const onKeyDown = (ev: KeyboardEvent) => {
-      if (ev.code !== "Space" && ev.key !== " ") return;
-      const target = ev.target as any;
-      const tag = (target?.tagName ?? "").toString().toLowerCase();
-      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) return;
+  const target = ev.target as any;
+  const tag = (target?.tagName ?? "").toString().toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) return;
 
-      ev.preventDefault();
-      const t = threeRef.current;
-      if (!t) return;
-      t.anim.center = { x: 0, y: 0, z: 0 };
-      clearHover();
-    };
+  // Ctrl+Z / Shift+Ctrl+Z（編集/ペイント共通）
+  const isZ = ev.key === "z" || ev.key === "Z";
+  if ((ev.ctrlKey || ev.metaKey) && isZ) {
+    ev.preventDefault();
+    if (ev.shiftKey) redo();
+    else undo();
+    return;
+  }
+
+  // Space: 視点の中心を原点へ
+  if (ev.code !== "Space" && ev.key !== " ") return;
+
+  ev.preventDefault();
+  const t = threeRef.current;
+  if (!t) return;
+  t.anim.center = { x: 0, y: 0, z: 0 };
+  clearHover();
+};
 
     renderer.domElement.addEventListener("pointermove", onPointerMove);
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
@@ -1016,9 +1306,10 @@ export default function VoxelEditor({
         disposeObject3D(threeRef.current.highlightPlane);
         disposeObject3D(threeRef.current.previewCube);
         threeRef.current.cubeGeo?.dispose?.();
-        threeRef.current.cubeMat?.dispose?.();
         threeRef.current.edgeGeo?.dispose?.();
-        threeRef.current.edgeMat?.dispose?.();
+        // dispose pooled materials
+        for (const m of threeRef.current.cubeMats?.values?.() || []) m?.dispose?.();
+        for (const m of threeRef.current.edgeMats?.values?.() || []) m?.dispose?.();
       }
 
       renderer.dispose();
@@ -1033,6 +1324,21 @@ export default function VoxelEditor({
     rebuildCubes(blocks);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [blocks]);
+
+  // colors 更新時：既存メッシュの material を差し替える（再構築はしない）
+  useEffect(() => {
+    const t = threeRef.current;
+    if (!t) return;
+    for (const mesh of t.cubesGroup.children as any[]) {
+      const key = mesh?.userData?.key as string | undefined;
+      if (!key) continue;
+      const col = (blockColors.get(key) || DEFAULT_BLOCK_COLOR) as string;
+      mesh.material = getCubeMat(t, col);
+      const edges = (mesh.children || []).find((c: any) => c?.name === "edges");
+      if (edges) edges.material = getEdgeMat(t, col);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blockColors]);
 
   // 参照画像・設定変更時に更新
   useEffect(() => {
@@ -1125,51 +1431,15 @@ export default function VoxelEditor({
     >
       <div className="canvasWrap" ref={wrapRef} />
 
-      {/* 左上：案内・色（スマホは折りたたみ） */}
-      
+      {/* 左上：最小HUD（詳細操作は /docs へ） */}
       <div className={`editorHud ${isCompactHud ? "compact" : ""}`}>
-        {(!isCompactHud || showHelp) && (
-          <div className={`editorHint ${isCompactHud ? "compact" : ""}`}>
-            {isCompactHud ? (
-              <>
-                タップ: 追加　長押し: 削除
-                <br />
-                2本指: 移動　ピンチ: ズーム
-              </>
-            ) : (
-              <>
-                クリック/タップ: 追加　右クリック/長押し: 削除
-                <br />
-                中ボタン/2本指: 移動　ホイール/ピンチ: ズーム　Space: 中央へ
-                <br />
-                ブロック: {cubeCount}
-              </>
-            )}
-          </div>
-        )}
-
         {/* 色とエッジ（スマホは「見た目」で畳む） */}
         <div className="editorHudTools" aria-label="色とエッジ">
           {isCompactHud && (
             <div className="hudCompactRow" aria-label="クイック操作">
               <div className="hudPill" aria-label="ブロック数">
-                ブロック: {cubeCount}
+                {t("editor.blocks", { n: cubeCount })}
               </div>
-              <button
-                type="button"
-                className={`miniToggle ${showHelp ? "on" : ""}`}
-                onClick={() => {
-                  setShowHelp((v) => {
-                    const next = !v;
-                    track("hud_toggle_help", { on: next });
-                    return next;
-                  });
-                }}
-                title="操作"
-                aria-label="操作"
-              >
-                操作
-              </button>
               <button
                 type="button"
                 className={`miniToggle ${showLook ? "on" : ""}`}
@@ -1180,33 +1450,44 @@ export default function VoxelEditor({
                     return next;
                   });
                 }}
-                title="見た目"
-                aria-label="見た目"
+                title={t("editor.look")}
+                aria-label={t("editor.look")}
               >
-                <span className="colorDot" style={{ background: cubeColor }} />
-                見た目
+                <span className="colorDot" style={{ background: paintColor }} />
+                {t("editor.look")}
               </button>
             </div>
           )}
 
           {(!isCompactHud || showLook) && (
             <>
-              <div className="swatches" aria-label="色">
-                {BAMBU_FILAMENT_COLORS.map((c) => (
-                  <button
-                    key={c.name}
-                    type="button"
-                    className={`swatch ${cubeColor.toLowerCase() === c.hex.toLowerCase() ? "selected" : ""}`}
-                    title={c.name}
-                    aria-label={c.name}
-                    onClick={() => {
-                      setCubeColor(c.hex);
-                      track("color_change", { name: c.name, hex: c.hex });
-                    }}
-                    style={{ background: c.hex }}
-                  />
-                ))}
+              {!isCompactHud && (
+                <div className="hudPill" aria-label="ブロック数">
+                  {t("editor.blocks", { n: cubeCount })}
+                </div>
+              )}
+
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }} aria-label="ペイント色">
+                <input
+                  type="color"
+                  value={paintColor}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setPaintColor(v);
+                    track("paint_color_change", { hex: v, method: "picker" });
+                  }}
+                  title={t("editor.pickColor")}
+                  aria-label={t("editor.pickColor")}
+                  style={{ width: 32, height: 22, padding: 0, border: "none", background: "transparent" }}
+                />
+                <span className="colorDot" style={{ background: paintColor }} />
               </div>
+
+{/*
+                NOTE: 「全ブロックの色が変わる」誤解を生みやすいので、
+                一旦パレット（スウォッチ）は廃止し、カラーピッカーのみ残す。
+              */}
+
               <button
                 type="button"
                 className={`miniToggle ${showEdges ? "on" : ""}`}
@@ -1217,10 +1498,10 @@ export default function VoxelEditor({
                     return next;
                   })
                 }
-                title="エッジ"
-                aria-label="エッジ"
+                title={t("editor.edges")}
+                aria-label={t("editor.edges")}
               >
-                エッジ
+                {t("editor.edges")}
               </button>
             </>
           )}
@@ -1228,11 +1509,11 @@ export default function VoxelEditor({
         <div className="editorHudActions">
           {!previewOpen && (
             <button type="button" className="hudLink" onClick={onOpenPreview}>
-              プレビュー
+              {t("editor.preview")}
             </button>
           )}
           <button type="button" className="hudLink" onClick={onClearAll}>
-            リセット
+            {t("editor.reset")}
           </button>
         </div>
       </div>
@@ -1240,36 +1521,36 @@ export default function VoxelEditor({
       {/* 端の三角：視点操作 */}
       <div className="overlayButtons">
         {showUp && (
-          <button type="button" className="triBtn posUp" onClick={rotateUp} title="上から見る">
+          <button type="button" className="triBtn posUp" onClick={rotateUp} title={t("editor.viewFromTop")}>
             <div className="tri up" />
           </button>
         )}
         {showDown && (
-          <button type="button" className="triBtn posDown" onClick={rotateDown} title="下から見る">
+          <button type="button" className="triBtn posDown" onClick={rotateDown} title={t("editor.viewFromBottom")}>
             <div className="tri down" />
           </button>
         )}
 
-        <button type="button" className="triBtn posLeft" onClick={rotateLeft} title="左へ">
+        <button type="button" className="triBtn posLeft" onClick={rotateLeft} title={t("editor.rotateLeft")}>
           <div className="tri left" />
         </button>
-        <button type="button" className="triBtn posRight" onClick={rotateRight} title="右へ">
+        <button type="button" className="triBtn posRight" onClick={rotateRight} title={t("editor.rotateRight")}>
           <div className="tri right" />
         </button>
 
         {/* ズーム（ホイールでもOK） */}
-        <div className="zoomStack" aria-label="ズーム">
-          <button type="button" className="zoomBtn" onClick={zoomIn} title="寄る">
+        <div className="zoomStack" aria-label={t("editor.zoom")}>
+          <button type="button" className="zoomBtn" onClick={zoomIn} title={t("editor.zoomIn")}>
             ＋
           </button>
-          <button type="button" className="zoomBtn" onClick={zoomOut} title="引く">
+          <button type="button" className="zoomBtn" onClick={zoomOut} title={t("editor.zoomOut")}>
             －
           </button>
         </div>
       </div>
 
       {/* 左下：アカウント */}
-      <AccountFab />
+      {/* AccountFab is rendered globally in <Providers /> */}
     </div>
   );
 }
