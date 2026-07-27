@@ -1,23 +1,26 @@
 import "./globals.css";
-import Providers from "@/components/Providers";
+import "./standalone-editor.css";
+import RootProviders from "@/components/RootProviders";
 import type { Metadata, Viewport } from "next";
 
 export const metadata: Metadata = {
-  title: "Q-BU!",
+  title: "Q-BU",
+  description: "ブラウザだけで使えるQ-BU編集画面"
 };
 
-// Mobile support
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  viewportFit: "cover",
+  maximumScale: 1,
+  userScalable: false,
+  viewportFit: "cover"
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="ja" suppressHydrationWarning>
       <body suppressHydrationWarning>
-        <Providers>{children}</Providers>
+        <RootProviders>{children}</RootProviders>
       </body>
     </html>
   );

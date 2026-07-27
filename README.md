@@ -1,62 +1,54 @@
-# Q-BU!
+# Q-BU standalone editor
 
-## セットアップ
+`/` を開くと、クラス選択・ログイン・参加QRを経由せず編集画面が直接表示されます。
+作品はサーバーへ送信せず、右上の「保存」から `.qbu` ファイルとして端末へダウンロードします。
+
+## ローカル起動
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
-## Supabase（ログイン + 利用ログ計測）
-
-1. Supabase で新しいプロジェクトを作成
-2. SQL Editor で `supabase.sql` を実行（telemetry_consents / event_logs を作成）
-3. `.env.local.example` を `.env.local` にコピーし、値を設定
+`http://localhost:3000/` を開いて確認します。Production build の確認は次のとおりです。
 
 ```bash
-cp .env.local.example .env.local
+npm run build
+npm run start
 ```
 
-- `NEXT_PUBLIC_SUPABASE_URL`
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- `SUPABASE_SERVICE_ROLE_KEY`（必須：未ログインでもログを保存するため）
+## 保存仕様
 
-4. Supabase Dashboard > Authentication
-   - Email / OAuth（Google等）を有効化
-   - Redirect URL に以下を追加
-     - `http://localhost:3000/auth/callback`
-     - 本番URL: `https://<your-domain>/auth/callback`
+- ブラウザ内でUTF-8 JSONを生成し、`<入力名>.qbu` としてダウンロード
+- `fetch`、Supabase、作品送信APIは使用しない
+- Class ID、Project ID、確認コード、参加者トークン、個人情報は保存しない
+- 編集中モデルとツールバー設定は、同じブラウザの `localStorage` に自動保存
 
-※ メールに表示されるアプリ名は Supabase 側のメールテンプレートで変更できます。
+`.qbu` のトップレベル形式は次のとおりです。
 
-## 使い方
-
-- 最初に「利用状況の計測（必須）」の同意が表示されます。
-  - 同意しない場合はアプリを利用できません。
-- 画面左下の丸いボタンからログインできます。
-  - 保存・エクスポートにはログインが必要です。
-- 同意後、ログインの有無に関係なく `event_logs` にイベントが保存されます。
-
-## Build gotchas (TypeScript / Next.js)
-
-### Blob + Uint8Array<ArrayBufferLike> error
-
-You may see a build error like:
-
-- `Type 'Uint8Array<ArrayBufferLike>' is not assignable to type 'BlobPart'`
-- `SharedArrayBuffer is not assignable to ArrayBuffer`
-
-This happens when a `Uint8Array` originates from Node `Buffer` (or other sources) whose underlying `.buffer` can be a `SharedArrayBuffer`, which TypeScript treats as `ArrayBufferLike`.
-
-**Fix:** copy into a plain `ArrayBuffer`-backed `Uint8Array` before passing to `Blob`:
-
-```ts
-const buf = Buffer.from(b64, "base64"); // Uint8Array<ArrayBufferLike>
-const copy = new Uint8Array(buf.byteLength);
-copy.set(buf);
-const blob = new Blob([copy], { type: "application/octet-stream" });
+```json
+{
+  "format": "qbu-standalone",
+  "version": 1,
+  "app": "Q-BU",
+  "exportedAt": "2026-01-01T00:00:00.000Z",
+  "project": {
+    "fileName": "Q-BU"
+  },
+  "editor": {
+    "gridSize": 32,
+    "maxBlocks": 300
+  },
+  "model": {
+    "version": 1,
+    "blocks": [
+      { "x": 0, "y": 0, "z": 0, "color": "white" }
+    ]
+  }
+}
 ```
 
-We do this in `components/qbu/myModelsUtils.ts: base64ToBytes()` so callers can safely do `new Blob([bytes])`.
+## 公開面
 
-**Regression check:** search for direct `Buffer.from(..., "base64")` usages and make sure the result is copied or uses `base64ToBytes()`.
+公開面は `/` のスタンドアロン編集画面だけです。旧版のソースは復元用に残していますが、
+旧ページと `/api/**` は `middleware.ts` で404にしています。

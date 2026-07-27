@@ -1,5 +1,5 @@
-import Builder from "@/components/Builder";
+import StandaloneEditor from "@/components/standalone/StandaloneEditor";
 
 export default function Page() {
-  return <Builder />;
+  return <StandaloneEditor />;
 }
