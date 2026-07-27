@@ -356,6 +356,16 @@
   height: 100%;
 }
 
+.standalone-visually-hidden {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .standalone-editor-overlay {
   position: fixed;
   z-index: 30;
@@ -495,15 +505,7 @@
 }
 
 .standalone-file-name-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-}
-
-.standalone-file-name-row > span {
-  color: #475569;
-  font-weight: 800;
+  display: block;
 }
 
 @media (max-width: 540px) {

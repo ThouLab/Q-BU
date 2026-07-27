@@ -30,7 +30,13 @@ export type StandaloneQbuPayload = {
   editor: {
     gridSize: number;
     maxBlocks: number;
+    blockSizeMm: number;
   };
+  model: VoxelModel;
+};
+
+export type ImportedQbu = {
+  fileName: string | null;
   model: VoxelModel;
 };
 
@@ -103,7 +109,11 @@ export function sanitizeQbuFileName(value: string): string {
   return /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(fallback) ? `${fallback}_` : fallback;
 }
 
-export function buildStandaloneQbu(fileName: string, model: VoxelModel): StandaloneQbuPayload {
+export function buildStandaloneQbu(
+  fileName: string,
+  model: VoxelModel,
+  blockSizeMm = 5
+): StandaloneQbuPayload {
   return {
     format: "qbu-standalone",
     version: 1,
@@ -114,8 +124,97 @@ export function buildStandaloneQbu(fileName: string, model: VoxelModel): Standal
     },
     editor: {
       gridSize: EDITOR_GRID_SIZE,
-      maxBlocks: EDITOR_MAX_BLOCKS
+      maxBlocks: EDITOR_MAX_BLOCKS,
+      blockSizeMm
     },
     model: normalizeModel(model)
   };
+}
+
+export function parseQbuPayload(
+  input: unknown,
+  options: { gridSize?: number; maxBlocks?: number } = {}
+): ImportedQbu {
+  if (!input || typeof input !== "object") {
+    throw new Error("QBUの内容がJSONオブジェクトではありません。");
+  }
+
+  const payload = input as {
+    format?: unknown;
+    version?: unknown;
+    project?: { fileName?: unknown };
+    model?: { version?: unknown; blocks?: unknown };
+  };
+  if (
+    (payload.format !== "qbu-standalone" && payload.format !== "qbu-workshop") ||
+    payload.version !== 1
+  ) {
+    throw new Error("対応していないQBU形式です。");
+  }
+  if (!payload.model || payload.model.version !== 1 || !Array.isArray(payload.model.blocks)) {
+    throw new Error("QBUに編集モデルが含まれていません。");
+  }
+
+  const gridSize = options.gridSize ?? EDITOR_GRID_SIZE;
+  const maxBlocks = options.maxBlocks ?? EDITOR_MAX_BLOCKS;
+  if (payload.model.blocks.length > maxBlocks) {
+    throw new Error(`ブロック数が上限（${maxBlocks}個）を超えています。`);
+  }
+
+  const blocks: VoxelBlock[] = [];
+  const seen = new Set<string>();
+  for (const value of payload.model.blocks) {
+    if (!value || typeof value !== "object") {
+      throw new Error("不正なブロック情報が含まれています。");
+    }
+    const block = value as Partial<VoxelBlock>;
+    const { x, y, z, color } = block;
+    if (
+      typeof x !== "number" ||
+      typeof y !== "number" ||
+      typeof z !== "number" ||
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(z) ||
+      !Number.isInteger(x) ||
+      !Number.isInteger(y) ||
+      !Number.isInteger(z) ||
+      !isWorkshopColor(color)
+    ) {
+      throw new Error("不正な座標または色のブロックが含まれています。");
+    }
+    const coord = { x, y, z };
+    if (!isWithinGrid(coord, gridSize)) {
+      throw new Error(`編集範囲（${gridSize}）外のブロックが含まれています。`);
+    }
+    const key = keyOf(coord);
+    if (seen.has(key)) {
+      throw new Error("同じ座標のブロックが重複しています。");
+    }
+    seen.add(key);
+    blocks.push({ ...coord, color });
+  }
+
+  const importedName =
+    typeof payload.project?.fileName === "string" && payload.project.fileName.trim()
+      ? sanitizeQbuFileName(payload.project.fileName)
+      : null;
+
+  return {
+    fileName: importedName,
+    model: normalizeModel({ version: 1, blocks })
+  };
+}
+
+export function parseQbuText(
+  text: string,
+  options: { gridSize?: number; maxBlocks?: number } = {}
+): ImportedQbu {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.replace(/^\uFEFF/, ""));
+  } catch {
+    throw new Error("QBUファイルをJSONとして読み込めませんでした。");
+  }
+  return parseQbuPayload(parsed, options);
 }

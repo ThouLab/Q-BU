@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type FormEvent,
   type ReactNode
 } from "react";
@@ -14,17 +15,18 @@ import {
   EDITOR_GRID_SIZE,
   EDITOR_MAX_BLOCKS,
   WORKSHOP_COLORS,
-  buildStandaloneQbu,
   initialModel,
   isWithinGrid,
   keyOf,
   normalizeModel,
+  parseQbuText,
   sanitizeQbuFileName,
   toBlockMap,
   type Coord,
   type VoxelModel,
   type WorkshopColor
 } from "@/components/standalone/editor-model";
+import { buildStandaloneArchive } from "@/components/standalone/export-archive";
 import VoxelStage, { type ExtendCandidate } from "@/components/standalone/VoxelStage";
 
 type ToolMode = "add" | "remove" | "pan" | "rotate";
@@ -36,6 +38,8 @@ type DraftState = "loading" | "saving" | "saved" | "error";
 const DRAFT_STORAGE_KEY = "qbu_standalone_draft_v1";
 const PREFERENCES_STORAGE_KEY = "qbu_standalone_editor_settings_v1";
 const FILE_NAME_STORAGE_KEY = "qbu_standalone_file_name_v1";
+const BLOCK_SIZE_STORAGE_KEY = "qbu_standalone_block_size_mm_v1";
+const MAX_IMPORT_FILE_BYTES = 5 * 1024 * 1024;
 
 const HOTKEY_ITEMS: Array<{ action: HotkeyAction; label: string }> = [
   { action: "add", label: "追加" },
@@ -205,9 +209,11 @@ export default function StandaloneEditor() {
   const [showUserSettings, setShowUserSettings] = useState(false);
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [fileName, setFileName] = useState("Q-BU");
+  const [blockSizeMm, setBlockSizeMm] = useState("5");
   const [isExporting, setIsExporting] = useState(false);
   const [downloadedAt, setDownloadedAt] = useState<string | null>(null);
   const fileNameInputRef = useRef<HTMLInputElement | null>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const normalizedModel = useMemo(() => normalizeModel(model), [model]);
   const extendLimit = useMemo(() => {
@@ -272,6 +278,10 @@ export default function StandaloneEditor() {
       }
       const savedFileName = window.localStorage.getItem(FILE_NAME_STORAGE_KEY);
       if (savedFileName) setFileName(sanitizeQbuFileName(savedFileName));
+      const savedBlockSize = Number(window.localStorage.getItem(BLOCK_SIZE_STORAGE_KEY));
+      if (Number.isFinite(savedBlockSize) && savedBlockSize >= 0.1 && savedBlockSize <= 100) {
+        setBlockSizeMm(String(savedBlockSize));
+      }
     } catch {
       setSidebarSide("left");
       setToolbarExpanded(false);
@@ -379,23 +389,54 @@ export default function StandaloneEditor() {
     setExtendCandidate(null);
   };
 
-  const saveQbu = (event: FormEvent<HTMLFormElement>) => {
+  const importQbu = async (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    if (file.size > MAX_IMPORT_FILE_BYTES) {
+      window.alert("QBUファイルが大きすぎます（上限5MB）。");
+      return;
+    }
+
+    try {
+      const imported = parseQbuText(await file.text());
+      if (!window.confirm("現在の作品を、選択したQBUの内容で置き換えますか？")) return;
+      handleModelChange(imported.model);
+      const importedName =
+        imported.fileName ?? sanitizeQbuFileName(file.name.replace(/\.qbu$/i, ""));
+      setFileName(importedName);
+      window.localStorage.setItem(FILE_NAME_STORAGE_KEY, importedName);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "QBUファイルを読み込めませんでした。");
+    }
+  };
+
+  const saveQbu = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (isExporting) return;
     setIsExporting(true);
     try {
       const safeFileName = sanitizeQbuFileName(fileName);
-      const payload = buildStandaloneQbu(safeFileName, normalizedModel);
-      const json = `${JSON.stringify(payload, null, 2)}\n`;
-      downloadBlob(new Blob([json], { type: "application/json;charset=utf-8" }), `${safeFileName}.qbu`);
+      const sizeMm = Number(blockSizeMm);
+      const archive = await buildStandaloneArchive({
+        fileName: safeFileName,
+        blockSizeMm: sizeMm,
+        model: normalizedModel
+      });
+      downloadBlob(archive.blob, archive.fileName);
       setFileName(safeFileName);
+      setBlockSizeMm(String(sizeMm));
       setDownloadedAt(new Date().toISOString());
       setShowSaveDialog(false);
       try {
         window.localStorage.setItem(FILE_NAME_STORAGE_KEY, safeFileName);
+        window.localStorage.setItem(BLOCK_SIZE_STORAGE_KEY, String(sizeMm));
       } catch {
         // File download does not depend on browser storage.
       }
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : "ZIPを書き出せませんでした。");
     } finally {
       setIsExporting(false);
     }
@@ -407,7 +448,7 @@ export default function StandaloneEditor() {
       : draftState === "saving"
         ? "端末内に自動保存中"
         : draftState === "saved"
-          ? "端末内に自動保存済み"
+          ? "保存済み"
           : "端末内の自動保存に失敗";
 
   return (
@@ -418,7 +459,7 @@ export default function StandaloneEditor() {
           Q-BU
         </div>
         <button className="standalone-save-button" onClick={() => setShowSaveDialog(true)} type="button">
-          保存
+          書き出し
         </button>
       </header>
 
@@ -488,6 +529,14 @@ export default function StandaloneEditor() {
               {COLOR_META[color].label}
             </ToolButton>
             <ToolButton
+              ariaLabel=".qbuファイルをインポート"
+              expanded
+              label=".qbuをインポート"
+              onClick={() => importInputRef.current?.click()}
+            >
+              ↓
+            </ToolButton>
+            <ToolButton
               ariaLabel="ユーザー設定"
               expanded
               label="ユーザー設定"
@@ -509,6 +558,15 @@ export default function StandaloneEditor() {
         )}
       </nav>
 
+      <input
+        accept=".qbu,application/json"
+        aria-label=".qbuファイルを選択"
+        className="standalone-visually-hidden"
+        onChange={importQbu}
+        ref={importInputRef}
+        type="file"
+      />
+
       <VoxelStage
         model={normalizedModel}
         toolMode={toolMode}
@@ -529,7 +587,7 @@ export default function StandaloneEditor() {
           draftState === "error" ? "danger" : ""
         ].join(" ")}
       >
-        {downloadedAt ? "ファイル保存済み・" : ""}
+        {downloadedAt ? "ZIP書き出し済み・" : ""}
         {draftLabel}（{normalizedModel.blocks.length}個）
       </span>
 
@@ -638,10 +696,7 @@ export default function StandaloneEditor() {
         <div className="standalone-editor-overlay">
           <form className="standalone-editor-modal standalone-stack" onSubmit={saveQbu}>
             <div>
-              <h2>作品を保存</h2>
-              <p className="standalone-muted">
-                作成内容をこの端末へ .qbu ファイルとしてダウンロードします。
-              </p>
+              <h2>作品を書き出し</h2>
             </div>
             <label className="standalone-field">
               ファイル名
@@ -655,12 +710,26 @@ export default function StandaloneEditor() {
                   required
                   value={fileName}
                 />
-                <span>.qbu</span>
               </div>
+            </label>
+            <label className="standalone-field">
+              1ブロックあたりの長さ（mm）
+              <input
+                aria-label="1ブロックあたりの長さ"
+                className="standalone-input"
+                inputMode="decimal"
+                max="100"
+                min="0.1"
+                onChange={(event) => setBlockSizeMm(event.target.value)}
+                required
+                step="0.1"
+                type="number"
+                value={blockSizeMm}
+              />
             </label>
             <div className="standalone-row">
               <button className="standalone-button" disabled={isExporting} type="submit">
-                {isExporting ? "保存中…" : "ダウンロード"}
+                {isExporting ? "作成中…" : "ZIPをダウンロード"}
               </button>
               <button
                 className="standalone-button ghost"
