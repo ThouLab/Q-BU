@@ -120,17 +120,17 @@ const validationWarnings = (model: VoxelModel): string[] => {
   return warnings;
 };
 
-const generateAsciiStlForColor = (
-  modelInput: VoxelModel,
-  color: WorkshopColor,
-  blockSizeMm: number
+const generateAsciiStl = (
+  model: VoxelModel,
+  blockSizeMm: number,
+  solidName: string,
+  color?: WorkshopColor
 ): string | null => {
-  const model = normalizeModel(modelInput);
-  const blocks = model.blocks.filter((block) => block.color === color);
+  const blocks = color ? model.blocks.filter((block) => block.color === color) : model.blocks;
   if (blocks.length === 0) return null;
 
-  const colorKeys = new Set(blocks.map(keyOf));
-  const lines = [`solid qbu_${color}`];
+  const includedKeys = new Set(blocks.map(keyOf));
+  const lines = [`solid ${solidName}`];
   const half = blockSizeMm / 2;
 
   for (const block of blocks) {
@@ -145,27 +145,30 @@ const generateAsciiStlForColor = (
       block.z * blockSizeMm + half
     ];
     for (const face of faceDefinitions(min, max)) {
-      if (colorKeys.has(keyOf(neighborForFace(block, face.normal)))) continue;
+      if (includedKeys.has(keyOf(neighborForFace(block, face.normal)))) continue;
       const [a, b, c, d] = face.corners;
       lines.push(facet(face.normal, a, b, c));
       lines.push(facet(face.normal, a, c, d));
     }
   }
 
-  lines.push(`endsolid qbu_${color}`);
+  lines.push(`endsolid ${solidName}`);
   return `${lines.join("\n")}\n`;
 };
 
-export type StandaloneArchive = {
+export type StandaloneExport = {
   blob: Blob;
   fileName: string;
 };
 
-export async function buildStandaloneArchive(input: {
+export type StandaloneArchive = StandaloneExport;
+
+export async function buildStandaloneExport(input: {
   fileName: string;
   blockSizeMm: number;
   model: VoxelModel;
-}): Promise<StandaloneArchive> {
+  singleStlOnly?: boolean;
+}): Promise<StandaloneExport> {
   if (!Number.isFinite(input.blockSizeMm) || input.blockSizeMm < 0.1 || input.blockSizeMm > 100) {
     throw new Error("1ブロックの長さは0.1〜100mmで指定してください。");
   }
@@ -174,6 +177,18 @@ export async function buildStandaloneArchive(input: {
   const model = normalizeModel(input.model);
   const fileName = sanitizeQbuFileName(input.fileName);
   const rootSegment = slugifyFileSegment(fileName);
+  const stlBaseName = `${PROJECT_CODE}_${rootSegment}`;
+  const combinedStl =
+    generateAsciiStl(model, input.blockSizeMm, "qbu_all") ??
+    "solid qbu_all\nendsolid qbu_all\n";
+
+  if (input.singleStlOnly) {
+    return {
+      blob: new Blob([combinedStl], { type: "model/stl" }),
+      fileName: `${stlBaseName}_all.stl`
+    };
+  }
+
   const zip = new JSZip();
   const root = zip.folder(rootSegment);
   const projectFolder = root?.folder(PROJECT_CODE);
@@ -182,11 +197,11 @@ export async function buildStandaloneArchive(input: {
   const qbuPayload = buildStandaloneQbu(fileName, model, input.blockSizeMm);
   projectFolder.file(`${PROJECT_CODE}.qbu`, `${JSON.stringify(qbuPayload, null, 2)}\n`);
 
-  const stlBaseName = `${PROJECT_CODE}_${rootSegment}`;
   for (const color of WORKSHOP_COLORS) {
-    const stl = generateAsciiStlForColor(model, color, input.blockSizeMm);
+    const stl = generateAsciiStl(model, input.blockSizeMm, `qbu_${color}`, color);
     if (stl) projectFolder.file(`${stlBaseName}_${color}.stl`, stl);
   }
+  projectFolder.file(`${stlBaseName}_all.stl`, combinedStl);
 
   const counts = colorCounts(model);
   const warnings = validationWarnings(model);
@@ -236,4 +251,12 @@ export async function buildStandaloneArchive(input: {
     blob,
     fileName: `${rootSegment}_${exportedAt.slice(0, 10)}.zip`
   };
+}
+
+export async function buildStandaloneArchive(input: {
+  fileName: string;
+  blockSizeMm: number;
+  model: VoxelModel;
+}): Promise<StandaloneArchive> {
+  return buildStandaloneExport(input);
 }

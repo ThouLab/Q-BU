@@ -54,3 +54,4 @@ qbu_draft*.json
 # ----------------------------
 supabase/.env
 supabase/.env.local
+/output/

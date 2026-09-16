@@ -356,6 +356,39 @@
   height: 100%;
 }
 
+.standalone-drop-overlay {
+  position: fixed;
+  z-index: 40;
+  inset: 12px;
+  display: grid;
+  place-items: center;
+  border: 3px dashed rgba(125, 211, 252, 0.92);
+  border-radius: 30px;
+  background: rgba(2, 6, 23, 0.82);
+  pointer-events: none;
+  backdrop-filter: blur(12px);
+}
+
+.standalone-drop-message {
+  display: grid;
+  gap: 8px;
+  max-width: min(440px, calc(100vw - 64px));
+  padding: 24px;
+  text-align: center;
+}
+
+.standalone-drop-message strong {
+  color: white;
+  font-size: clamp(22px, 5vw, 34px);
+  line-height: 1.25;
+}
+
+.standalone-drop-message span {
+  color: #bae6fd;
+  font-size: 14px;
+  font-weight: 700;
+}
+
 .standalone-visually-hidden {
   position: fixed;
   width: 1px;
@@ -428,6 +461,41 @@
   padding: 11px 12px;
   background: white;
   color: #0f172a;
+}
+
+.standalone-export-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  border: 1px solid #bfdbfe;
+  border-radius: 16px;
+  padding: 12px;
+  background: #eff6ff;
+  color: #1e3a8a;
+  cursor: pointer;
+}
+
+.standalone-checkbox {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  margin: 1px 0 0;
+  accent-color: var(--standalone-brand);
+}
+
+.standalone-export-option span {
+  display: grid;
+  gap: 3px;
+}
+
+.standalone-export-option strong {
+  font-size: 14px;
+}
+
+.standalone-export-option small {
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .standalone-button {

@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type DragEvent as ReactDragEvent,
   type FormEvent,
   type ReactNode
 } from "react";
@@ -19,14 +20,14 @@ import {
   isWithinGrid,
   keyOf,
   normalizeModel,
-  parseQbuText,
+  parseQbuFile,
   sanitizeQbuFileName,
   toBlockMap,
   type Coord,
   type VoxelModel,
   type WorkshopColor
 } from "@/components/standalone/editor-model";
-import { buildStandaloneArchive } from "@/components/standalone/export-archive";
+import { buildStandaloneExport } from "@/components/standalone/export-archive";
 import VoxelStage, { type ExtendCandidate } from "@/components/standalone/VoxelStage";
 
 type ToolMode = "add" | "remove" | "pan" | "rotate";
@@ -210,10 +211,14 @@ export default function StandaloneEditor() {
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [fileName, setFileName] = useState("Q-BU");
   const [blockSizeMm, setBlockSizeMm] = useState("5");
+  const [singleStlOnly, setSingleStlOnly] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [isDragActive, setIsDragActive] = useState(false);
+  const [frameRequest, setFrameRequest] = useState(0);
   const [downloadedAt, setDownloadedAt] = useState<string | null>(null);
   const fileNameInputRef = useRef<HTMLInputElement | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const dragDepthRef = useRef(0);
 
   const normalizedModel = useMemo(() => normalizeModel(model), [model]);
   const extendLimit = useMemo(() => {
@@ -235,7 +240,10 @@ export default function StandaloneEditor() {
   useEffect(() => {
     try {
       const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
-      if (raw) setModel(normalizeModel(JSON.parse(raw)));
+      if (raw) {
+        setModel(normalizeModel(JSON.parse(raw)));
+        setFrameRequest((current) => current + 1);
+      }
       setDraftState("saved");
     } catch {
       setModel(initialModel());
@@ -389,42 +397,100 @@ export default function StandaloneEditor() {
     setExtendCandidate(null);
   };
 
-  const importQbu = async (event: ChangeEvent<HTMLInputElement>) => {
-    const input = event.currentTarget;
-    const file = input.files?.[0];
-    input.value = "";
-    if (!file) return;
+  const importQbuFile = useCallback(async (file: File) => {
+    if (!/\.qbu$/i.test(file.name)) {
+      window.alert("拡張子が.qbuのファイルを選択してください。");
+      return;
+    }
     if (file.size > MAX_IMPORT_FILE_BYTES) {
       window.alert("QBUファイルが大きすぎます（上限5MB）。");
       return;
     }
 
     try {
-      const imported = parseQbuText(await file.text());
+      const imported = await parseQbuFile(file);
       if (!window.confirm("現在の作品を、選択したQBUの内容で置き換えますか？")) return;
+      setExtendCandidate(null);
+      setShowUserSettings(false);
+      setShowSaveDialog(false);
       handleModelChange(imported.model);
+      setFrameRequest((current) => current + 1);
       const importedName =
         imported.fileName ?? sanitizeQbuFileName(file.name.replace(/\.qbu$/i, ""));
       setFileName(importedName);
-      window.localStorage.setItem(FILE_NAME_STORAGE_KEY, importedName);
+      try {
+        window.localStorage.setItem(FILE_NAME_STORAGE_KEY, importedName);
+      } catch {
+        // Import remains usable when browser storage is unavailable.
+      }
     } catch (error) {
       window.alert(error instanceof Error ? error.message : "QBUファイルを読み込めませんでした。");
     }
+  }, [handleModelChange]);
+
+  const importQbu = async (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = "";
+    if (file) await importQbuFile(file);
+  };
+
+  const isFileDrag = (event: ReactDragEvent<HTMLElement>): boolean =>
+    Array.from(event.dataTransfer.types).includes("Files");
+
+  const handleQbuDragEnter = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current += 1;
+    setIsDragActive(true);
+  };
+
+  const handleQbuDragOver = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const handleQbuDragLeave = (event: ReactDragEvent<HTMLElement>) => {
+    if (!isFileDrag(event) && dragDepthRef.current === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDragActive(false);
+  };
+
+  const handleQbuDrop = async (event: ReactDragEvent<HTMLElement>) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current = 0;
+    setIsDragActive(false);
+
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length !== 1) {
+      window.alert("QBUファイルを1つだけドロップしてください。");
+      return;
+    }
+    await importQbuFile(files[0]);
   };
 
   const saveQbu = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (isExporting) return;
     setIsExporting(true);
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
     try {
       const safeFileName = sanitizeQbuFileName(fileName);
       const sizeMm = Number(blockSizeMm);
-      const archive = await buildStandaloneArchive({
+      const exportedFile = await buildStandaloneExport({
         fileName: safeFileName,
         blockSizeMm: sizeMm,
-        model: normalizedModel
+        model: normalizedModel,
+        singleStlOnly
       });
-      downloadBlob(archive.blob, archive.fileName);
+      downloadBlob(exportedFile.blob, exportedFile.fileName);
       setFileName(safeFileName);
       setBlockSizeMm(String(sizeMm));
       setDownloadedAt(new Date().toISOString());
@@ -436,7 +502,7 @@ export default function StandaloneEditor() {
         // File download does not depend on browser storage.
       }
     } catch (error) {
-      window.alert(error instanceof Error ? error.message : "ZIPを書き出せませんでした。");
+      window.alert(error instanceof Error ? error.message : "ファイルを書き出せませんでした。");
     } finally {
       setIsExporting(false);
     }
@@ -452,7 +518,14 @@ export default function StandaloneEditor() {
           : "端末内の自動保存に失敗";
 
   return (
-    <main className="standalone-editor" onContextMenu={(event) => event.preventDefault()}>
+    <main
+      className="standalone-editor"
+      onContextMenu={(event) => event.preventDefault()}
+      onDragEnter={handleQbuDragEnter}
+      onDragLeave={handleQbuDragLeave}
+      onDragOver={handleQbuDragOver}
+      onDrop={handleQbuDrop}
+    >
       <header className="standalone-editor-header">
         <div className="standalone-brand-mark">
           <span className="standalone-brand-dot" />
@@ -559,7 +632,7 @@ export default function StandaloneEditor() {
       </nav>
 
       <input
-        accept=".qbu,application/json"
+        accept=".qbu"
         aria-label=".qbuファイルを選択"
         className="standalone-visually-hidden"
         onChange={importQbu}
@@ -567,8 +640,18 @@ export default function StandaloneEditor() {
         type="file"
       />
 
+      {isDragActive && (
+        <div aria-live="polite" className="standalone-drop-overlay" role="status">
+          <div className="standalone-drop-message">
+            <strong>Q-BUファイルをここにドロップ</strong>
+            <span>現在の作品と置き換える前に確認します</span>
+          </div>
+        </div>
+      )}
+
       <VoxelStage
         model={normalizedModel}
+        frameRequest={frameRequest}
         toolMode={toolMode}
         color={color}
         gridSize={EDITOR_GRID_SIZE}
@@ -587,7 +670,7 @@ export default function StandaloneEditor() {
           draftState === "error" ? "danger" : ""
         ].join(" ")}
       >
-        {downloadedAt ? "ZIP書き出し済み・" : ""}
+        {downloadedAt ? "書き出し済み・" : ""}
         {draftLabel}（{normalizedModel.blocks.length}個）
       </span>
 
@@ -727,9 +810,25 @@ export default function StandaloneEditor() {
                 value={blockSizeMm}
               />
             </label>
+            <label className="standalone-export-option">
+              <input
+                checked={singleStlOnly}
+                className="standalone-checkbox"
+                onChange={(event) => setSingleStlOnly(event.target.checked)}
+                type="checkbox"
+              />
+              <span>
+                <strong>1つのSTLで出力</strong>
+                <small>すべての色を単色として統合した全体STLだけをダウンロードします</small>
+              </span>
+            </label>
             <div className="standalone-row">
               <button className="standalone-button" disabled={isExporting} type="submit">
-                {isExporting ? "作成中…" : "ZIPをダウンロード"}
+                {isExporting
+                  ? "作成中…"
+                  : singleStlOnly
+                    ? "STLをダウンロード"
+                    : "ZIPをダウンロード"}
               </button>
               <button
                 className="standalone-button ghost"

@@ -180,6 +180,19 @@ declare module "three" {
     [key: string]: Any;
   }
 
+  export class BufferGeometry {
+    constructor();
+    setAttribute(name: string, attribute: Any): this;
+    computeBoundingSphere(): void;
+    dispose(): void;
+    [key: string]: Any;
+  }
+
+  export class BufferAttribute {
+    constructor(array: Any, itemSize: number, normalized?: boolean);
+    [key: string]: Any;
+  }
+
   export class PlaneGeometry {
     constructor(w: number, h: number);
     dispose(): void;
