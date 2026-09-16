@@ -25,6 +25,7 @@ type PickResult = ExtendCandidate;
 
 type Props = {
   model: VoxelModel;
+  frameRequest: number;
   toolMode: ToolMode;
   color: WorkshopColor;
   gridSize: number;
@@ -43,7 +44,7 @@ type PointerState = {
 
 const TAP_TOLERANCE_PX = 14;
 const MIN_CAMERA_DISTANCE = 3;
-const MAX_CAMERA_DISTANCE = 80;
+const MAX_CAMERA_DISTANCE = 400;
 const START_TARGET_Y_OFFSET = 1.05;
 const DEFAULT_CAMERA = {
   yaw: 0.76,
@@ -53,6 +54,22 @@ const DEFAULT_CAMERA = {
   targetY: START_TARGET_Y_OFFSET,
   targetZ: 0
 };
+const CUBE_SIZE = 0.96;
+const CUBE_HALF_SIZE = CUBE_SIZE / 2;
+const CUBE_EDGE_OFFSETS = new Float32Array([
+  -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE,
+  -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE,
+  -CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE,
+  -CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE,
+  -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE,
+  CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE,
+  -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE,
+  CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE,
+  -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE,
+  CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE,
+  -CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE,
+  CUBE_HALF_SIZE, CUBE_HALF_SIZE, -CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE, CUBE_HALF_SIZE
+]);
 
 const snapAxisNormal = (normal: THREE.Vector3): Coord => {
   const absX = Math.abs(normal.x);
@@ -88,6 +105,7 @@ export default function VoxelStage(props: Props) {
   const propsRef = useRef(props);
   const viewRef = useRef({ ...DEFAULT_CAMERA });
   const hasFramedInitialModelRef = useRef(false);
+  const lastFrameRequestRef = useRef(props.frameRequest);
   const pointerMapRef = useRef(new Map<number, PointerState>());
   const gestureRef = useRef<{ distance: number; midX: number; midY: number } | null>(null);
   const pressTimerRef = useRef<number | null>(null);
@@ -182,11 +200,13 @@ export default function VoxelStage(props: Props) {
   const disposeGroup = useCallback((group: THREE.Group) => {
     const geometries = new Set<{ dispose: () => void }>();
     const materials = new Set<{ dispose: () => void }>();
+    const instancedMeshes = new Set<THREE.InstancedMesh>();
     group.traverse((object) => {
       const renderable = object as {
         geometry?: { dispose?: () => void };
         material?: { dispose?: () => void } | Array<{ dispose?: () => void }>;
       };
+      if (object instanceof THREE.InstancedMesh) instancedMeshes.add(object);
       if (renderable.geometry?.dispose) geometries.add(renderable.geometry as { dispose: () => void });
       const objectMaterials = Array.isArray(renderable.material) ? renderable.material : [renderable.material];
       for (const material of objectMaterials) {
@@ -194,6 +214,7 @@ export default function VoxelStage(props: Props) {
       }
     });
     group.clear();
+    instancedMeshes.forEach((mesh) => mesh.dispose?.());
     geometries.forEach((geometry) => geometry.dispose());
     materials.forEach((material) => material.dispose());
   }, []);
@@ -202,30 +223,67 @@ export default function VoxelStage(props: Props) {
     const three = threeRef.current;
     if (!three) return;
     disposeGroup(three.group);
-    const geometry = new THREE.BoxGeometry(0.96, 0.96, 0.96);
-    const edgeGeometry = new THREE.EdgesGeometry(geometry);
+    const blocks = normalizeModel(propsRef.current.model).blocks;
+    const blocksByColor = new Map<WorkshopColor, typeof blocks>();
+    for (const block of blocks) {
+      const colorBlocks = blocksByColor.get(block.color);
+      if (colorBlocks) colorBlocks.push(block);
+      else blocksByColor.set(block.color, [block]);
+    }
 
-    for (const block of normalizeModel(propsRef.current.model).blocks) {
+    const cubeGeometry = new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE);
+    const instanceMatrix = new THREE.Matrix4();
+    for (const [color, colorBlocks] of blocksByColor) {
       const material = new THREE.MeshStandardMaterial({
-        color: COLOR_META[block.color].hex,
+        color: COLOR_META[color].hex,
         roughness: 0.65,
         metalness: 0.02
       });
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.position.set(block.x, block.y, block.z);
-      mesh.userData.coord = { x: block.x, y: block.y, z: block.z };
-      mesh.userData.key = keyOf(block);
+      const mesh = new THREE.InstancedMesh(cubeGeometry, material, colorBlocks.length);
+      const coords: Coord[] = [];
+      for (let index = 0; index < colorBlocks.length; index += 1) {
+        const block = colorBlocks[index];
+        instanceMatrix.makeTranslation(block.x, block.y, block.z);
+        mesh.setMatrixAt(index, instanceMatrix);
+        coords.push({ x: block.x, y: block.y, z: block.z });
+      }
+      mesh.userData.coords = coords;
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingBox();
+      mesh.computeBoundingSphere();
+      three.group.add(mesh);
+    }
+
+    if (blocks.length > 0) {
+      const edgePositions = new Float32Array(blocks.length * CUBE_EDGE_OFFSETS.length);
+      let positionIndex = 0;
+      for (const block of blocks) {
+        for (let offsetIndex = 0; offsetIndex < CUBE_EDGE_OFFSETS.length; offsetIndex += 3) {
+          edgePositions[positionIndex] = block.x + CUBE_EDGE_OFFSETS[offsetIndex];
+          edgePositions[positionIndex + 1] = block.y + CUBE_EDGE_OFFSETS[offsetIndex + 1];
+          edgePositions[positionIndex + 2] = block.z + CUBE_EDGE_OFFSETS[offsetIndex + 2];
+          positionIndex += 3;
+        }
+      }
+      const edgeGeometry = new THREE.BufferGeometry();
+      edgeGeometry.setAttribute("position", new THREE.BufferAttribute(edgePositions, 3));
+      edgeGeometry.computeBoundingSphere();
       const edges = new THREE.LineSegments(
         edgeGeometry,
         new THREE.LineBasicMaterial({ color: "#0f172a", transparent: true, opacity: 0.25 })
       );
-      mesh.add(edges);
-      three.group.add(mesh);
+      three.group.add(edges);
+    } else {
+      cubeGeometry.dispose();
     }
 
-    if (!hasFramedInitialModelRef.current) {
+    if (
+      !hasFramedInitialModelRef.current ||
+      lastFrameRequestRef.current !== propsRef.current.frameRequest
+    ) {
       frameModel(propsRef.current.model);
       hasFramedInitialModelRef.current = true;
+      lastFrameRequestRef.current = propsRef.current.frameRequest;
     }
 
     updateCamera();
@@ -240,10 +298,19 @@ export default function VoxelStage(props: Props) {
     three.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
     three.group.updateMatrixWorld(true);
     three.raycaster.setFromCamera(three.pointer, three.camera);
-    const hits = three.raycaster.intersectObjects(three.group.children, false);
+    const voxelMeshes = three.group.children.filter(
+      (object): object is THREE.InstancedMesh => object instanceof THREE.InstancedMesh
+    );
+    const hits = three.raycaster.intersectObjects(voxelMeshes, false);
     const hit = hits[0];
-    if (hit?.object?.userData?.coord) {
-      const from = hit.object.userData.coord as Coord;
+    if (
+      hit?.object instanceof THREE.InstancedMesh &&
+      typeof hit.instanceId === "number"
+    ) {
+      const coords = hit.object.userData.coords as Coord[] | undefined;
+      const instanceCoord = coords?.[hit.instanceId];
+      if (!instanceCoord) return null;
+      const from = { ...instanceCoord };
       const faceNormalLocal = hit.face?.normal?.clone() ?? new THREE.Vector3(0, 1, 0);
       const normalWorld = faceNormalLocal
         .applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld))
@@ -316,7 +383,8 @@ export default function VoxelStage(props: Props) {
     const fillLight = new THREE.DirectionalLight("#93c5fd", 1.5);
     fillLight.position.set(-8, 4, -6);
     scene.add(fillLight);
-    const grid = new THREE.GridHelper(36, 36, "#334155", "#1e293b");
+    const gridSize = Math.max(2, Math.min(propsRef.current.gridSize, 160));
+    const grid = new THREE.GridHelper(gridSize, gridSize, "#334155", "#1e293b");
     grid.position.y = -0.55;
     scene.add(grid);
 
@@ -491,7 +559,7 @@ export default function VoxelStage(props: Props) {
 
   useEffect(() => {
     rebuildCubes();
-  }, [props.model, rebuildCubes]);
+  }, [props.frameRequest, props.model, rebuildCubes]);
 
   return <div ref={mountRef} className="standalone-canvas-stage" />;
 }
