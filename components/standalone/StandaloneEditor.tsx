@@ -24,23 +24,40 @@ import {
   sanitizeQbuFileName,
   toBlockMap,
   type Coord,
+  type VoxelBlock,
   type VoxelModel,
   type WorkshopColor
 } from "@/components/standalone/editor-model";
 import { buildStandaloneExport } from "@/components/standalone/export-archive";
+import {
+  STL_MAX_FILE_BYTES,
+  voxelizeStlFile
+} from "@/components/standalone/stl-voxel-client";
 import VoxelStage, { type ExtendCandidate } from "@/components/standalone/VoxelStage";
 
 type ToolMode = "add" | "remove" | "pan" | "rotate";
 type SidebarSide = "left" | "right";
 type HotkeyAction = "add" | "remove" | "pan" | "rotate" | "color" | "settings";
 type HotkeyMap = Record<HotkeyAction, string>;
-type DraftState = "loading" | "saving" | "saved" | "error";
+type DraftState = "loading" | "saving" | "saved" | "skipped" | "error";
+
+type StlPlacement = {
+  sourceName: string;
+  voxels: Int16Array;
+  offset: Coord;
+  color: WorkshopColor;
+  triangleCount: number;
+  dimensions: Coord;
+  bounds: { min: Coord; max: Coord };
+};
 
 const DRAFT_STORAGE_KEY = "qbu_standalone_draft_v1";
 const PREFERENCES_STORAGE_KEY = "qbu_standalone_editor_settings_v1";
 const FILE_NAME_STORAGE_KEY = "qbu_standalone_file_name_v1";
 const BLOCK_SIZE_STORAGE_KEY = "qbu_standalone_block_size_mm_v1";
-const MAX_IMPORT_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_QBU_IMPORT_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_LOCAL_BACKUP_BLOCKS = 20_000;
+const EMPTY_VOXEL_MODEL: VoxelModel = { version: 1, blocks: [] };
 
 const HOTKEY_ITEMS: Array<{ action: HotkeyAction; label: string }> = [
   { action: "add", label: "追加" },
@@ -95,6 +112,17 @@ const normalizeHotkeys = (source?: Partial<Record<HotkeyAction, string>>): Hotke
     used.add(hotkey);
   }
   return next;
+};
+
+const isStarterModel = (model: VoxelModel): boolean => {
+  const block = model.blocks[0];
+  return (
+    model.blocks.length === 1 &&
+    block.x === 0 &&
+    block.y === 0 &&
+    block.z === 0 &&
+    block.color === "white"
+  );
 };
 
 const isTextInputTarget = (target: EventTarget | null): boolean => {
@@ -168,6 +196,7 @@ type ToolButtonProps = {
   ariaLabel: string;
   children: ReactNode;
   className?: string;
+  disabled?: boolean;
   expanded: boolean;
   label: string;
   onClick: () => void;
@@ -178,6 +207,7 @@ function ToolButton({
   ariaLabel,
   children,
   className = "",
+  disabled = false,
   expanded,
   label,
   onClick
@@ -186,6 +216,7 @@ function ToolButton({
     <button
       aria-label={ariaLabel}
       className={["standalone-tool-button", active ? "active" : "", className].filter(Boolean).join(" ")}
+      disabled={disabled}
       onClick={onClick}
       type="button"
     >
@@ -197,6 +228,7 @@ function ToolButton({
 
 export default function StandaloneEditor() {
   const [model, setModel] = useState<VoxelModel>(() => initialModel());
+  const [isPristineModel, setIsPristineModel] = useState(true);
   const [draftState, setDraftState] = useState<DraftState>("loading");
   const [draftHydrated, setDraftHydrated] = useState(false);
   const [toolMode, setToolMode] = useState<ToolMode>("add");
@@ -209,18 +241,93 @@ export default function StandaloneEditor() {
   const [preferencesHydrated, setPreferencesHydrated] = useState(false);
   const [showUserSettings, setShowUserSettings] = useState(false);
   const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [showImportDialog, setShowImportDialog] = useState(false);
   const [fileName, setFileName] = useState("Q-BU");
   const [blockSizeMm, setBlockSizeMm] = useState("5");
   const [singleStlOnly, setSingleStlOnly] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
+  const [isImportingStl, setIsImportingStl] = useState(false);
+  const [stlPlacement, setStlPlacement] = useState<StlPlacement | null>(null);
+  const [placementOffsetInputs, setPlacementOffsetInputs] = useState<Record<keyof Coord, string>>({
+    x: "0",
+    y: "0",
+    z: "0"
+  });
   const [frameRequest, setFrameRequest] = useState(0);
   const [downloadedAt, setDownloadedAt] = useState<string | null>(null);
   const fileNameInputRef = useRef<HTMLInputElement | null>(null);
-  const importInputRef = useRef<HTMLInputElement | null>(null);
+  const qbuInputRef = useRef<HTMLInputElement | null>(null);
+  const stlInputRef = useRef<HTMLInputElement | null>(null);
+  const qbuImportChoiceRef = useRef<HTMLButtonElement | null>(null);
+  const stlImportSequenceRef = useRef(0);
   const dragDepthRef = useRef(0);
 
-  const normalizedModel = useMemo(() => normalizeModel(model), [model]);
+  // All model entry points validate or create unique in-grid blocks. Keep the canonical
+  // state by reference so large models are not copied and sorted again on every render.
+  const normalizedModel = model;
+  const hasStlPlacement = stlPlacement !== null;
+  const placementBaseBlocks = useMemo(
+    () => (isPristineModel && isStarterModel(normalizedModel) ? [] : normalizedModel.blocks),
+    [isPristineModel, normalizedModel]
+  );
+  const stageModel = useMemo<VoxelModel>(
+    () =>
+      stlPlacement && placementBaseBlocks.length === 0 && isPristineModel
+        ? EMPTY_VOXEL_MODEL
+        : normalizedModel,
+    [isPristineModel, normalizedModel, placementBaseBlocks.length, stlPlacement]
+  );
+  const occupiedKeys = useMemo(
+    () =>
+      hasStlPlacement
+        ? new Set(placementBaseBlocks.map((block) => keyOf(block)))
+        : new Set<string>(),
+    [hasStlPlacement, placementBaseBlocks]
+  );
+  const stlPreview = useMemo(() => {
+    const previewBlocks: VoxelBlock[] = [];
+    const addableBlocks: VoxelBlock[] = [];
+    let collisionCount = 0;
+    let outOfBoundsCount = 0;
+    if (!stlPlacement) {
+      return { previewBlocks, addableBlocks, collisionCount, outOfBoundsCount, limitExceeded: false };
+    }
+
+    for (let index = 0; index < stlPlacement.voxels.length; index += 3) {
+      const block: VoxelBlock = {
+        x: stlPlacement.voxels[index] + stlPlacement.offset.x,
+        y: stlPlacement.voxels[index + 1] + stlPlacement.offset.y,
+        z: stlPlacement.voxels[index + 2] + stlPlacement.offset.z,
+        color: stlPlacement.color
+      };
+      if (!isWithinGrid(block, EDITOR_GRID_SIZE)) {
+        outOfBoundsCount += 1;
+        continue;
+      }
+      previewBlocks.push(block);
+      if (occupiedKeys.has(keyOf(block))) collisionCount += 1;
+      else addableBlocks.push(block);
+    }
+
+    return {
+      previewBlocks,
+      addableBlocks,
+      collisionCount,
+      outOfBoundsCount,
+      limitExceeded: placementBaseBlocks.length + addableBlocks.length > EDITOR_MAX_BLOCKS
+    };
+  }, [occupiedKeys, placementBaseBlocks.length, stlPlacement]);
+
+  const placementOffsetLimits = useMemo(() => {
+    if (!stlPlacement) return null;
+    const radius = Math.floor(EDITOR_GRID_SIZE / 2);
+    return {
+      x: { min: -radius - stlPlacement.bounds.min.x, max: radius - 1 - stlPlacement.bounds.max.x },
+      y: { min: -radius - stlPlacement.bounds.min.y, max: radius - 1 - stlPlacement.bounds.max.y },
+      z: { min: -radius - stlPlacement.bounds.min.z, max: radius - 1 - stlPlacement.bounds.max.z }
+    };
+  }, [stlPlacement]);
   const extendLimit = useMemo(() => {
     if (!extendCandidate) return 0;
     const map = toBlockMap(normalizedModel);
@@ -241,12 +348,15 @@ export default function StandaloneEditor() {
     try {
       const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
       if (raw) {
-        setModel(normalizeModel(JSON.parse(raw)));
+        const restoredModel = normalizeModel(JSON.parse(raw));
+        setModel(restoredModel);
+        setIsPristineModel(isStarterModel(restoredModel));
         setFrameRequest((current) => current + 1);
       }
       setDraftState("saved");
     } catch {
       setModel(initialModel());
+      setIsPristineModel(true);
       setDraftState("error");
     } finally {
       setDraftHydrated(true);
@@ -255,6 +365,15 @@ export default function StandaloneEditor() {
 
   useEffect(() => {
     if (!draftHydrated) return;
+    if (normalizedModel.blocks.length > MAX_LOCAL_BACKUP_BLOCKS) {
+      try {
+        window.localStorage.removeItem(DRAFT_STORAGE_KEY);
+      } catch {
+        // Large models stay editable even when browser storage is unavailable.
+      }
+      setDraftState("skipped");
+      return;
+    }
     setDraftState("saving");
     const timer = window.setTimeout(() => {
       try {
@@ -316,8 +435,19 @@ export default function StandaloneEditor() {
     window.setTimeout(() => fileNameInputRef.current?.select(), 0);
   }, [showSaveDialog]);
 
+  useEffect(() => {
+    if (!showImportDialog) return;
+    window.setTimeout(() => qbuImportChoiceRef.current?.focus(), 0);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowImportDialog(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [showImportDialog]);
+
   const handleModelChange = useCallback((nextModel: VoxelModel) => {
     setDownloadedAt(null);
+    setIsPristineModel(false);
     setModel(nextModel);
   }, []);
 
@@ -359,6 +489,9 @@ export default function StandaloneEditor() {
         event.metaKey ||
         showUserSettings ||
         showSaveDialog ||
+        showImportDialog ||
+        isImportingStl ||
+        stlPlacement ||
         extendCandidate ||
         isTextInputTarget(event.target)
       ) {
@@ -373,7 +506,16 @@ export default function StandaloneEditor() {
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [extendCandidate, hotkeys, runHotkeyAction, showSaveDialog, showUserSettings]);
+  }, [
+    extendCandidate,
+    hotkeys,
+    isImportingStl,
+    runHotkeyAction,
+    showImportDialog,
+    showSaveDialog,
+    showUserSettings,
+    stlPlacement
+  ]);
 
   const applyExtend = () => {
     if (!extendCandidate) return;
@@ -402,8 +544,8 @@ export default function StandaloneEditor() {
       window.alert("拡張子が.qbuのファイルを選択してください。");
       return;
     }
-    if (file.size > MAX_IMPORT_FILE_BYTES) {
-      window.alert("QBUファイルが大きすぎます（上限5MB）。");
+    if (file.size > MAX_QBU_IMPORT_FILE_BYTES) {
+      window.alert("QBUファイルが大きすぎます（上限100MB）。");
       return;
     }
 
@@ -411,6 +553,8 @@ export default function StandaloneEditor() {
       const imported = await parseQbuFile(file);
       if (!window.confirm("現在の作品を、選択したQBUの内容で置き換えますか？")) return;
       setExtendCandidate(null);
+      setStlPlacement(null);
+      setShowImportDialog(false);
       setShowUserSettings(false);
       setShowSaveDialog(false);
       handleModelChange(imported.model);
@@ -434,6 +578,95 @@ export default function StandaloneEditor() {
     input.value = "";
     if (file) await importQbuFile(file);
   };
+
+  const importStlFile = useCallback(async (file: File) => {
+    if (!/\.stl$/i.test(file.name)) {
+      window.alert("拡張子が.stlのファイルを選択してください。");
+      return;
+    }
+    if (file.size > STL_MAX_FILE_BYTES) {
+      window.alert(
+        `STLファイルが大きすぎます（上限${Math.floor(STL_MAX_FILE_BYTES / 1024 / 1024)}MB）。`
+      );
+      return;
+    }
+
+    setShowImportDialog(false);
+    setShowUserSettings(false);
+    setShowSaveDialog(false);
+    setExtendCandidate(null);
+    setIsImportingStl(true);
+    const importSequence = stlImportSequenceRef.current + 1;
+    stlImportSequenceRef.current = importSequence;
+    try {
+      const result = await voxelizeStlFile(file);
+      if (stlImportSequenceRef.current !== importSequence) return;
+      if (result.voxelCount <= 0 || result.voxels.length === 0) {
+        throw new Error("STLから表面ボクセルを作成できませんでした。");
+      }
+      const initialOffset = {
+        x: -Math.round((result.bounds.min.x + result.bounds.max.x) / 2),
+        y: -result.bounds.min.y,
+        z: -Math.round((result.bounds.min.z + result.bounds.max.z) / 2)
+      };
+      setStlPlacement({
+        sourceName: file.name,
+        voxels: result.voxels,
+        offset: initialOffset,
+        color,
+        triangleCount: result.triangleCount,
+        dimensions: result.dimensions,
+        bounds: result.bounds
+      });
+      setPlacementOffsetInputs({
+        x: String(initialOffset.x),
+        y: String(initialOffset.y),
+        z: String(initialOffset.z)
+      });
+      setToolMode("rotate");
+      setFrameRequest((current) => current + 1);
+    } catch (error) {
+      if (stlImportSequenceRef.current !== importSequence) return;
+      window.alert(error instanceof Error ? error.message : "STLファイルを読み込めませんでした。");
+    } finally {
+      if (stlImportSequenceRef.current === importSequence) setIsImportingStl(false);
+    }
+  }, [color]);
+
+  const importStl = async (event: ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = "";
+    if (file) await importStlFile(file);
+  };
+
+  const setPlacementAxis = useCallback((axis: keyof Coord, value: number) => {
+    if (!stlPlacement || !Number.isFinite(value)) return;
+    const radius = Math.floor(EDITOR_GRID_SIZE / 2);
+    const minimum = -radius - stlPlacement.bounds.min[axis];
+    const maximum = radius - 1 - stlPlacement.bounds.max[axis];
+    const nextValue = Math.min(maximum, Math.max(minimum, Math.trunc(value)));
+    setStlPlacement((current) =>
+      current ? { ...current, offset: { ...current.offset, [axis]: nextValue } } : current
+    );
+    setPlacementOffsetInputs((inputs) => ({ ...inputs, [axis]: String(nextValue) }));
+  }, [stlPlacement]);
+
+  const placeStl = useCallback(() => {
+    if (
+      !stlPlacement ||
+      stlPreview.outOfBoundsCount > 0 ||
+      stlPreview.limitExceeded ||
+      stlPreview.addableBlocks.length === 0
+    ) {
+      return;
+    }
+    handleModelChange({
+      version: 1,
+      blocks: [...placementBaseBlocks, ...stlPreview.addableBlocks]
+    });
+    setStlPlacement(null);
+  }, [handleModelChange, placementBaseBlocks, stlPlacement, stlPreview]);
 
   const isFileDrag = (event: ReactDragEvent<HTMLElement>): boolean =>
     Array.from(event.dataTransfer.types).includes("Files");
@@ -468,12 +701,27 @@ export default function StandaloneEditor() {
     dragDepthRef.current = 0;
     setIsDragActive(false);
 
-    const files = Array.from(event.dataTransfer.files);
-    if (files.length !== 1) {
-      window.alert("QBUファイルを1つだけドロップしてください。");
+    if (isImportingStl) {
+      window.alert("STLを変換中です。完了してから次のファイルを読み込んでください。");
       return;
     }
-    await importQbuFile(files[0]);
+
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length !== 1) {
+      window.alert(".qbuまたは.stlファイルを1つだけドロップしてください。");
+      return;
+    }
+    const file = files[0];
+    setShowImportDialog(false);
+    if (/\.qbu$/i.test(file.name)) {
+      await importQbuFile(file);
+      return;
+    }
+    if (/\.stl$/i.test(file.name)) {
+      await importStlFile(file);
+      return;
+    }
+    window.alert("読み込める形式は.qbuまたは.stlです。");
   };
 
   const saveQbu = async (event: FormEvent<HTMLFormElement>) => {
@@ -515,6 +763,8 @@ export default function StandaloneEditor() {
         ? "端末内に自動保存中"
         : draftState === "saved"
           ? "保存済み"
+          : draftState === "skipped"
+            ? "大規模作品のため自動保存対象外"
           : "端末内の自動保存に失敗";
 
   return (
@@ -531,7 +781,12 @@ export default function StandaloneEditor() {
           <span className="standalone-brand-dot" />
           Q-BU
         </div>
-        <button className="standalone-save-button" onClick={() => setShowSaveDialog(true)} type="button">
+        <button
+          className="standalone-save-button"
+          disabled={isImportingStl || Boolean(stlPlacement)}
+          onClick={() => setShowSaveDialog(true)}
+          type="button"
+        >
           書き出し
         </button>
       </header>
@@ -557,6 +812,7 @@ export default function StandaloneEditor() {
         <ToolButton
           ariaLabel="ブロックの追加"
           active={toolMode === "add"}
+          disabled={Boolean(stlPlacement) || isImportingStl}
           expanded={toolbarExpanded}
           label="ブロックの追加"
           onClick={() => setToolMode("add")}
@@ -566,6 +822,7 @@ export default function StandaloneEditor() {
         <ToolButton
           ariaLabel="ブロックの削除"
           active={toolMode === "remove"}
+          disabled={Boolean(stlPlacement) || isImportingStl}
           expanded={toolbarExpanded}
           label="ブロックの削除"
           onClick={() => setToolMode("remove")}
@@ -575,6 +832,7 @@ export default function StandaloneEditor() {
         <ToolButton
           ariaLabel="視点の移動"
           active={toolMode === "pan"}
+          disabled={isImportingStl}
           expanded={toolbarExpanded}
           label="視点の移動"
           onClick={() => setToolMode("pan")}
@@ -584,6 +842,7 @@ export default function StandaloneEditor() {
         <ToolButton
           ariaLabel="視点の回転"
           active={toolMode === "rotate"}
+          disabled={isImportingStl}
           expanded={toolbarExpanded}
           label="視点の回転"
           onClick={() => setToolMode("rotate")}
@@ -595,6 +854,7 @@ export default function StandaloneEditor() {
             <ToolButton
               ariaLabel={`色の切り替え（${COLOR_META[color].label}）`}
               className={`standalone-color-tool swatch-${color}`}
+              disabled={Boolean(stlPlacement) || isImportingStl}
               expanded
               label="色の切り替え"
               onClick={() => setColor(nextColor(color))}
@@ -602,15 +862,17 @@ export default function StandaloneEditor() {
               {COLOR_META[color].label}
             </ToolButton>
             <ToolButton
-              ariaLabel=".qbuファイルをインポート"
+              ariaLabel="ファイルをインポート"
+              disabled={Boolean(stlPlacement) || isImportingStl}
               expanded
-              label=".qbuをインポート"
-              onClick={() => importInputRef.current?.click()}
+              label="インポート"
+              onClick={() => setShowImportDialog(true)}
             >
               ↓
             </ToolButton>
             <ToolButton
               ariaLabel="ユーザー設定"
+              disabled={Boolean(stlPlacement) || isImportingStl}
               expanded
               label="ユーザー設定"
               onClick={() => setShowUserSettings(true)}
@@ -636,21 +898,33 @@ export default function StandaloneEditor() {
         aria-label=".qbuファイルを選択"
         className="standalone-visually-hidden"
         onChange={importQbu}
-        ref={importInputRef}
+        ref={qbuInputRef}
+        tabIndex={-1}
+        type="file"
+      />
+      <input
+        accept=".stl"
+        aria-label=".stlファイルを選択"
+        className="standalone-visually-hidden"
+        onChange={importStl}
+        ref={stlInputRef}
+        tabIndex={-1}
         type="file"
       />
 
       {isDragActive && (
         <div aria-live="polite" className="standalone-drop-overlay" role="status">
           <div className="standalone-drop-message">
-            <strong>Q-BUファイルをここにドロップ</strong>
-            <span>現在の作品と置き換える前に確認します</span>
+            <strong>.qbu または .stl をここにドロップ</strong>
+            <span>ファイル形式を自動判定して読み込みます</span>
           </div>
         </div>
       )}
 
       <VoxelStage
-        model={normalizedModel}
+        model={stageModel}
+        previewBlocks={stlPreview.previewBlocks}
+        interactionLocked={Boolean(stlPlacement) || isImportingStl}
         frameRequest={frameRequest}
         toolMode={toolMode}
         color={color}
@@ -660,7 +934,144 @@ export default function StandaloneEditor() {
         onExtendCandidate={openExtendCandidate}
       />
 
-      <div className="standalone-editor-hint">{TOOL_MODE_LABELS[toolMode]}</div>
+      {stlPlacement && placementOffsetLimits && (
+        <section
+          aria-label="STLの配置"
+          className={`standalone-placement-panel ${sidebarSide === "left" ? "right" : "left"}`}
+        >
+          <div>
+            <h2>STLを配置</h2>
+            <p className="standalone-placement-help" title={stlPlacement.sourceName}>
+              {stlPlacement.sourceName}
+            </p>
+          </div>
+          <div className="standalone-placement-summary">
+            <span>
+              サイズ {stlPlacement.dimensions.x}×{stlPlacement.dimensions.y}×{stlPlacement.dimensions.z}
+            </span>
+            <span>{stlPlacement.voxels.length / 3} ボクセル</span>
+            <span>{stlPlacement.triangleCount.toLocaleString()} 三角形</span>
+            <span>{stlPreview.addableBlocks.length.toLocaleString()} 個を追加</span>
+          </div>
+          <div className="standalone-field">
+            単色
+            <div className="standalone-color-options">
+              {WORKSHOP_COLORS.map((stlColor) => (
+                <button
+                  aria-pressed={stlPlacement.color === stlColor}
+                  className={`standalone-color-choice ${stlPlacement.color === stlColor ? "active" : ""}`}
+                  key={stlColor}
+                  onClick={() =>
+                    setStlPlacement((current) => current && { ...current, color: stlColor })
+                  }
+                  type="button"
+                >
+                  <span
+                    className="standalone-color-dot"
+                    style={{ background: COLOR_META[stlColor].hex }}
+                  />
+                  {COLOR_META[stlColor].label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="standalone-field">
+            XYZ位置
+            <div className="standalone-axis-grid">
+              {(["x", "y", "z"] as const).map((axis) => {
+                const limits = placementOffsetLimits[axis];
+                const value = stlPlacement.offset[axis];
+                return (
+                  <div className="standalone-axis-row" key={axis}>
+                    <span>{axis.toUpperCase()}</span>
+                    <button
+                      aria-label={`${axis.toUpperCase()}を1減らす`}
+                      disabled={value <= limits.min}
+                      onClick={() => setPlacementAxis(axis, value - 1)}
+                      type="button"
+                    >
+                      −
+                    </button>
+                    <input
+                      aria-label={`${axis.toUpperCase()}位置`}
+                      autoComplete="off"
+                      inputMode="text"
+                      onBlur={() => {
+                        const parsed = Number.parseInt(placementOffsetInputs[axis], 10);
+                        setPlacementAxis(axis, Number.isFinite(parsed) ? parsed : value);
+                      }}
+                      onChange={(event) => {
+                        if (/^-?\d*$/.test(event.target.value)) {
+                          setPlacementOffsetInputs((inputs) => ({
+                            ...inputs,
+                            [axis]: event.target.value
+                          }));
+                        }
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") event.currentTarget.blur();
+                      }}
+                      pattern="-?[0-9]*"
+                      spellCheck={false}
+                      type="text"
+                      value={placementOffsetInputs[axis]}
+                    />
+                    <button
+                      aria-label={`${axis.toUpperCase()}を1増やす`}
+                      disabled={value >= limits.max}
+                      onClick={() => setPlacementAxis(axis, value + 1)}
+                      type="button"
+                    >
+                      ＋
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          {stlPreview.collisionCount > 0 && (
+            <div className="standalone-notice">
+              既存ブロックと重なる{stlPreview.collisionCount.toLocaleString()}個は変更せずに配置します。
+            </div>
+          )}
+          {stlPreview.outOfBoundsCount > 0 && (
+            <div className="standalone-notice">
+              編集範囲外のボクセルが{stlPreview.outOfBoundsCount.toLocaleString()}個あります。
+            </div>
+          )}
+          {stlPreview.limitExceeded && (
+            <div className="standalone-notice">
+              配置すると上限{EDITOR_MAX_BLOCKS.toLocaleString()}個を超えます。
+            </div>
+          )}
+          <p className="standalone-placement-help">
+            半透明表示はプレビューです。確定するまで現在の作品は変更されません。
+          </p>
+          <div className="standalone-row">
+            <button
+              className="standalone-button"
+              disabled={
+                stlPreview.outOfBoundsCount > 0 ||
+                stlPreview.limitExceeded ||
+                stlPreview.addableBlocks.length === 0
+              }
+              onClick={placeStl}
+              type="button"
+            >
+              この位置に配置
+            </button>
+            <button
+              className="standalone-button ghost"
+              onClick={() => setStlPlacement(null)}
+              type="button"
+            >
+              キャンセル
+            </button>
+          </div>
+        </section>
+      )}
+
+      {!stlPlacement && <div className="standalone-editor-hint">{TOOL_MODE_LABELS[toolMode]}</div>}
 
       <span
         aria-live="polite"
@@ -673,6 +1084,63 @@ export default function StandaloneEditor() {
         {downloadedAt ? "書き出し済み・" : ""}
         {draftLabel}（{normalizedModel.blocks.length}個）
       </span>
+
+      {showImportDialog && (
+        <div className="standalone-editor-overlay">
+          <section
+            aria-labelledby="standalone-import-title"
+            aria-modal="true"
+            className="standalone-editor-modal standalone-stack"
+            role="dialog"
+          >
+            <div>
+              <h2 id="standalone-import-title">インポート</h2>
+              <p className="standalone-muted">読み込むファイル形式を選択してください。</p>
+            </div>
+            <div className="standalone-import-options">
+              <button
+                className="standalone-import-choice"
+                onClick={() => {
+                  setShowImportDialog(false);
+                  qbuInputRef.current?.click();
+                }}
+                ref={qbuImportChoiceRef}
+                type="button"
+              >
+                <strong>.qbu</strong>
+                <small>保存済みのQ-BU作品で、現在の作品を置き換えます。</small>
+              </button>
+              <button
+                className="standalone-import-choice"
+                onClick={() => {
+                  setShowImportDialog(false);
+                  stlInputRef.current?.click();
+                }}
+                type="button"
+              >
+                <strong>.stl</strong>
+                <small>表面を最長辺40でボクセル化し、位置を決めて作品へ追加します。</small>
+              </button>
+            </div>
+            <button
+              className="standalone-button ghost"
+              onClick={() => setShowImportDialog(false)}
+              type="button"
+            >
+              キャンセル
+            </button>
+          </section>
+        </div>
+      )}
+
+      {isImportingStl && (
+        <div aria-live="polite" className="standalone-editor-overlay" role="status">
+          <section className="standalone-editor-modal standalone-stack">
+            <h2>STLを変換中…</h2>
+            <p>表面の形状を解析し、最長辺40のボクセルプレビューを作成しています。</p>
+          </section>
+        </div>
+      )}
 
       {extendCandidate && (
         <div className="standalone-editor-overlay">

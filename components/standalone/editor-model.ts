@@ -1,7 +1,7 @@
 import { unpackQbu } from "@/components/qbu/qbuFile";
 
 export const EDITOR_GRID_SIZE = 160;
-export const EDITOR_MAX_BLOCKS = 9_999;
+export const EDITOR_MAX_BLOCKS = 999_999;
 export const WORKSHOP_COLORS = ["white", "red", "blue"] as const;
 
 export type WorkshopColor = (typeof WORKSHOP_COLORS)[number];
@@ -81,12 +81,14 @@ export function normalizeModel(input: unknown): VoxelModel {
 
   return {
     version: 1,
-    blocks: [...byCoord.values()].sort((a, b) => keyOf(a).localeCompare(keyOf(b)))
+    blocks: [...byCoord.values()].sort(
+      (a, b) => a.x - b.x || a.y - b.y || a.z - b.z
+    )
   };
 }
 
 export function toBlockMap(model: VoxelModel): Map<string, VoxelBlock> {
-  return new Map(normalizeModel(model).blocks.map((block) => [keyOf(block), block]));
+  return new Map(model.blocks.map((block) => [keyOf(block), block]));
 }
 
 export function isWithinGrid(coord: Coord, gridSize: number): boolean {
